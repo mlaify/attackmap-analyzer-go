@@ -538,3 +538,116 @@ def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
     result = analyzer.analyze(repo)
     assert result.files_scanned == 0
     assert result.routes == []
+
+
+# ---------- False-positive routes and test code (#2) ----------
+
+
+def test_chi_lookup_get_calls_produce_no_routes(tmp_path: Path) -> None:
+    """Header/query/config `.Get("key")` lookups in a chi file are not routes."""
+    (tmp_path / "main.go").write_text(
+        'package main\n'
+        '\n'
+        'import (\n'
+        '    "net/http"\n'
+        '    "github.com/go-chi/chi/v5"\n'
+        '    "github.com/spf13/viper"\n'
+        ')\n'
+        '\n'
+        'func handler(w http.ResponseWriter, req *http.Request) {\n'
+        '    token := req.Header.Get("Authorization")\n'
+        '    q := req.URL.Query()\n'
+        '    id := q.Get("id")\n'
+        '    name := req.Form.Get("/name")\n'
+        '    dsn := viper.Get("db.dsn")\n'
+        '    _, _, _, _ = token, id, name, dsn\n'
+        '}\n'
+        '\n'
+        'func main() {\n'
+        '    r := chi.NewRouter()\n'
+        '    r.Get("/users/{id}", handler)\n'
+        '    http.ListenAndServe(":8080", r)\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = GoAnalyzer().analyze(tmp_path)
+    assert {(r.method, r.path) for r in result.routes} == {("GET", "/users/{id}")}
+
+
+def test_fiber_ctx_get_produces_no_routes(tmp_path: Path) -> None:
+    (tmp_path / "main.go").write_text(
+        'package main\n'
+        '\n'
+        'import "github.com/gofiber/fiber/v2"\n'
+        '\n'
+        'func main() {\n'
+        '    app := fiber.New()\n'
+        '    app.Get("/items", func(c *fiber.Ctx) error {\n'
+        '        key := c.Get("X-Api-Key")\n'
+        '        ref := c.Get("/referer", "none")\n'
+        '        return c.SendString(key + ref)\n'
+        '    })\n'
+        '    app.Listen(":3000")\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    result = GoAnalyzer().analyze(tmp_path)
+    assert {(r.method, r.path) for r in result.routes} == {("GET", "/items")}
+
+
+def _write_chi_with_tests(root: Path) -> None:
+    (root / "main.go").write_text(
+        'package main\n'
+        '\n'
+        'import "github.com/go-chi/chi/v5"\n'
+        '\n'
+        'func routes() {\n'
+        '    r := chi.NewRouter()\n'
+        '    r.Get("/users", listUsers)\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (root / "main_test.go").write_text(
+        'package main\n'
+        '\n'
+        'import (\n'
+        '    "net/http"\n'
+        '    "net/http/httptest"\n'
+        ')\n'
+        '\n'
+        'func TestX(t *testing.T) {\n'
+        '    mux := http.NewServeMux()\n'
+        '    mux.HandleFunc("/test-only", func(w http.ResponseWriter, r *http.Request) {})\n'
+        '    srv := httptest.NewServer(mux)\n'
+        '    defer srv.Close()\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    fixture = root / "testdata"
+    fixture.mkdir()
+    (fixture / "server.go").write_text(
+        'package fixture\n'
+        '\n'
+        'import "net/http"\n'
+        '\n'
+        'func init() { http.HandleFunc("/fixture-only", nil) }\n',
+        encoding="utf-8",
+    )
+
+
+def test_test_files_and_testdata_not_scanned_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ATTACKMAP_INCLUDE_TESTS", raising=False)
+    _write_chi_with_tests(tmp_path)
+    result = GoAnalyzer().analyze(tmp_path)
+    assert {(r.method, r.path, r.file) for r in result.routes} == {("GET", "/users", "main.go")}
+    assert result.files_scanned == 1
+
+
+def test_include_tests_env_opts_test_code_back_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATTACKMAP_INCLUDE_TESTS", "1")
+    _write_chi_with_tests(tmp_path)
+    result = GoAnalyzer().analyze(tmp_path)
+    routes = {(r.path, r.file) for r in result.routes}
+    assert ("/test-only", "main_test.go") in routes
+    assert ("/fixture-only", "testdata/server.go") in routes
+    assert result.files_scanned == 3

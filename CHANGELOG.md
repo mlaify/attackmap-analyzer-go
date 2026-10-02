@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Title-case `.Get("...")` lookups in chi and fiber files are no longer reported
+  as routes (`req.Header.Get("Authorization")`, `q.Get("id")`, `viper.Get(...)`,
+  fiber `c.Get("X-Api-Key")`). A chi/fiber registration now needs a path literal
+  starting with `/` (or fiber's `*`) followed by a handler argument, on a
+  receiver that isn't a request accessor or the request context
+  ([#2](https://github.com/mlaify/attackmap-analyzer-go/issues/2)).
+- `*_test.go` files and `testdata/` directories are no longer scanned, so
+  `httptest` registrations stop showing up as production routes. The old
+  `SKIP_SUFFIXES` constant was declared but never applied and is removed. Set
+  `ATTACKMAP_INCLUDE_TESTS=1` to scan test code. Directories the core treats as
+  test code (`test/`, `tests/`, `e2e/`, `fixtures/`, ...) are skipped too
+  ([#2](https://github.com/mlaify/attackmap-analyzer-go/issues/2)).
 - A repo checked out under a directory named like a skip dir (e.g. `/build/...`,
   `.../out/...`) was silently skipped entirely; skip dirs are now matched only
   inside the repo.
