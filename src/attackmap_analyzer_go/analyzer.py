@@ -22,6 +22,7 @@ from pathlib import Path
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
 
+from . import route_auth as ra
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -65,6 +66,14 @@ GIN_ROUTE_PATTERN = re.compile(
 # catch-all `*` is the one exception) followed by a handler argument.
 CHI_ECHO_ROUTE_PATTERN = re.compile(
     r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options)\(\s*"([/*][^"]*)"\s*,',
+)
+
+# Chi inline middleware: r.With(mw...).Post("/path", h). The receiver's
+# `.With(` is matched here; the chained verb call is read after its `)`.
+CHI_WITH_PATTERN = re.compile(r"\b(\w+)\s*\.\s*With\s*\(")
+CHI_WITH_CHAIN_PATTERN = re.compile(r"\s*\.\s*With\s*\(")
+CHI_WITH_VERB_PATTERN = re.compile(
+    r'\s*\.\s*(Get|Post|Put|Delete|Patch|Head|Options)\s*\(\s*"([/*][^"]*)"\s*,'
 )
 
 # Receivers that are never routers: request accessors (`r.Header.Get`,
@@ -307,23 +316,80 @@ class GoAnalyzer:
         is_fiber = _file_is_fiber(content)
         is_gorilla = _file_is_gorilla_mux(content)
         is_net_http = _file_is_net_http(content)
+        routers: list[ra.FileRouters] = []  # built on first use
+
+        def resolve(receiver: str, offset: int, path: str, local: list[ra.Guard]) -> ra.Resolution:
+            if not routers:
+                routers.append(ra.FileRouters(content))
+            return routers[0].resolve_route(receiver, offset, path, local)
+
+        def local_guards(start: int, paren: int, first: int, last: int | None) -> list[ra.Guard] | None:
+            """Auth middleware among a registration's arguments [first:last];
+            the evidence quotes the registration from ``start``."""
+            close = ra.matching_close(content, paren)
+            if close < 0:
+                return None
+            context = content[start : min(close + 1, start + 400)]
+            args = ra.split_args(content, paren, close)[first:last]
+            return [g for s, e in args if (g := ra.guard_from_arg(content, s, e, context))]
 
         # Gin / echo: uppercase verb method (r.GET, e.POST, ...). Echo's runtime API
         # is the same uppercase shape as gin's despite different surface labels.
+        # Route middleware: gin `r.POST(path, mw..., h)`, echo `e.POST(path, h, mw...)`.
         if is_gin or is_echo:
+            echo_args = is_echo and not is_gin
             for match in GIN_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(2).upper(), match.group(3)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                if index is None:
+                    continue
+                paren = content.find("(", match.start())
+                local = local_guards(match.start(), paren, 2, None) if echo_args else local_guards(match.start(), paren, 1, -1)
+                if local is not None:
+                    self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
 
         # Chi / fiber: title-case verb method (r.Get, app.Post, ...). Only run when
         # we know which framework is in this file; otherwise we'd mis-attribute
         # generic `.Get(...)` calls on non-router types.
+        # Route middleware: fiber `app.Post(path, mw..., h)`; chi uses `.With(mw)`.
         if is_chi or is_fiber:
             for match in CHI_ECHO_ROUTE_PATTERN.finditer(content):
                 if match.group(1) in NON_ROUTER_RECEIVERS:
                     continue
                 method, path = match.group(2).upper(), match.group(3)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                if index is None:
+                    continue
+                paren = content.find("(", match.start())
+                local = local_guards(match.start(), paren, 1, -1) if is_fiber and not is_chi else []
+                if local is not None:
+                    self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
+
+        # Chi inline middleware: r.With(mw...)[.With(mw...)].Post("/path", h).
+        if is_chi:
+            for match in CHI_WITH_PATTERN.finditer(content):
+                if match.group(1) in NON_ROUTER_RECEIVERS:
+                    continue
+                local: list[ra.Guard] = []
+                paren = match.end() - 1
+                while True:
+                    guards = local_guards(match.start(), paren, 0, None)
+                    close = ra.matching_close(content, paren)
+                    if guards is None:
+                        break
+                    local += guards
+                    chained = CHI_WITH_CHAIN_PATTERN.match(content, close + 1)
+                    if chained:
+                        paren = chained.end() - 1
+                        continue
+                    verb = CHI_WITH_VERB_PATTERN.match(content, close + 1)
+                    if verb:
+                        method, path = verb.group(1).upper(), verb.group(2)
+                        line = line_of(content, match.start())
+                        index = self._append_unique_route(result, path, method, relative, line)
+                        if index is not None:
+                            self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
+                    break
 
         # Gorilla/mux: HandleFunc + chained .Methods("GET", "POST")
         if is_gorilla:
@@ -431,11 +497,41 @@ class GoAnalyzer:
     # ---------- Append helpers (dedup-aware) ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int | None,
+        *,
+        auth: str = ra.UNKNOWN,
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> int | None:
+        """Append a route once per (path, method, file); return its index, or
+        None when it was already recorded."""
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
+            return None
+        result.routes.append(
+            Route(
+                path=path, method=method, file=file, line=line,
+                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+            )
+        )
+        return len(result.routes) - 1
+
+    @staticmethod
+    def _set_route_auth(result: ScanResult, index: int, resolution: ra.Resolution) -> None:
+        """Declare a route's auth (AttackMap#256); older cores ignore the fields.
+        Rebuilt rather than mutated so Route's guard_evidence redaction runs."""
+        if resolution.auth == ra.UNKNOWN:
             return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        route = result.routes[index]
+        result.routes[index] = Route(
+            path=route.path, method=route.method, file=route.file, line=route.line,
+            auth=resolution.auth, guards=list(resolution.guards), guard_evidence=resolution.evidence,
+        )
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:

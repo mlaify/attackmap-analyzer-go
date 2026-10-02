@@ -651,3 +651,164 @@ def test_include_tests_env_opts_test_code_back_in(tmp_path: Path, monkeypatch: p
     assert ("/test-only", "main_test.go") in routes
     assert ("/fixture-only", "testdata/server.go") in routes
     assert result.files_scanned == 3
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+
+def _routes(tmp_path: Path, name: str, source: str) -> dict:
+    (tmp_path / name).write_text(source, encoding="utf-8")
+    return {f"{r.method} {r.path}": r for r in GoAnalyzer().analyze(tmp_path).routes}
+
+
+def test_gin_route_group_and_use_guards_are_required(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func main() {\n"
+        "\tr := gin.Default()\n"
+        '\tr.POST("/comments", AuthRequired(), createComment)\n'
+        '\tadmin := r.Group("/admin", gin.BasicAuth(gin.Accounts{"foo": "bar"}))\n'
+        '\tadmin.DELETE("/users/:id", deleteUser)\n'
+        '\tapi := r.Group("/api")\n'
+        '\tapi.POST("/early", early)\n'
+        "\tapi.Use(AuthRequired())\n"
+        '\tapi.PUT("/profile", updateProfile)\n'
+        '\tr.POST("/login", login)\n'
+        "}\n",
+    )
+    comments = routes["POST /comments"]
+    assert comments.auth == "required"
+    assert comments.guards == ["AuthRequired"]
+    assert comments.guard_evidence == 'r.POST("/comments", AuthRequired(), createComment)'
+    assert routes["DELETE /users/:id"].guards == ["gin.BasicAuth"]
+    assert routes["PUT /profile"].auth == "required"
+    assert routes["PUT /profile"].guard_evidence == "api.Use(AuthRequired())"
+    # gin copies a group's middleware at registration: an earlier route isn't guarded.
+    assert routes["POST /early"].auth == "unknown"
+    assert routes["POST /login"].auth == "unknown"
+    assert routes["POST /login"].guard_evidence is None
+
+
+def test_chi_use_group_and_with_guards(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        'package server\n\nimport (\n\t"github.com/go-chi/chi/v5"\n\t"github.com/go-chi/jwtauth/v5"\n)\n\n'
+        "func Routes() *chi.Mux {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.Post("/signup", signup)\n'
+        '\tr.With(jwtauth.Verifier(ta), jwtauth.Authenticator(ta)).Post("/orders", createOrder)\n'
+        "\tr.Group(func(r chi.Router) {\n"
+        "\t\tr.Use(jwtauth.Verifier(ta))\n"
+        "\t\tr.Use(jwtauth.Authenticator(ta))\n"
+        '\t\tr.Delete("/orders/{id}", deleteOrder)\n'
+        "\t})\n"
+        '\tr.Route("/public", func(pr chi.Router) {\n'
+        "\t\tpr.Use(jwtauth.Verifier(ta))\n"
+        '\t\tpr.Post("/feedback", feedback)\n'
+        "\t})\n"
+        "\treturn r\n"
+        "}\n",
+    )
+    # `r.With(...).Post(...)` is now a route, guarded inline.
+    assert routes["POST /orders"].auth == "required"
+    assert routes["POST /orders"].guards == ["jwtauth.Authenticator"]
+    # The Group closure's Use applies inside it only.
+    assert routes["DELETE /orders/{id}"].auth == "required"
+    assert routes["POST /signup"].auth == "unknown"
+    # jwtauth.Verifier only parses a token; it doesn't reject anonymous callers.
+    assert routes["POST /feedback"].auth == "unknown"
+
+
+def test_router_passed_as_parameter_keeps_its_use_guard(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        'package api\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func Register(r *gin.RouterGroup) {\n"
+        "\tr.Use(RequireUser())\n"
+        '\tr.POST("/notes", createNote)\n'
+        "}\n\n"
+        "func RegisterPublic(r *gin.RouterGroup) {\n"
+        '\tr.POST("/contact", contact)\n'
+        "}\n",
+    )
+    assert routes["POST /notes"].auth == "required"
+    # A different function's `r` is a different router.
+    assert routes["POST /contact"].auth == "unknown"
+
+
+def test_echo_skipper_paths_are_explicitly_public(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport (\n\techojwt "github.com/labstack/echo-jwt/v4"\n\t"github.com/labstack/echo/v4"\n)\n\n'
+        "func main() {\n"
+        "\te := echo.New()\n"
+        "\te.Use(echojwt.WithConfig(echojwt.Config{\n"
+        '\t\tSigningKey: []byte("k"),\n'
+        "\t\tSkipper: func(c echo.Context) bool {\n"
+        '\t\t\treturn c.Path() == "/register" || strings.HasPrefix(c.Path(), "/hooks/")\n'
+        "\t\t},\n"
+        "\t}))\n"
+        '\te.POST("/register", register)\n'
+        '\te.POST("/hooks/stripe", stripe)\n'
+        '\te.PUT("/settings", settings)\n'
+        "}\n",
+    )
+    register = routes["POST /register"]
+    assert register.auth == "anonymous"
+    assert register.guards == []
+    assert register.guard_evidence.startswith("Skipper: func(c echo.Context) bool")
+    assert routes["POST /hooks/stripe"].auth == "anonymous"
+    assert routes["PUT /settings"].auth == "required"
+    assert routes["PUT /settings"].guards == ["echojwt.WithConfig"]
+
+
+def test_group_guard_skipper_opts_one_route_out(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/labstack/echo/v4"\n\n'
+        "func main() {\n"
+        "\te := echo.New()\n"
+        '\tapi := e.Group("/api", middleware.KeyAuthWithConfig(middleware.KeyAuthConfig{\n'
+        '\t\tSkipper: func(c echo.Context) bool { return c.Path() == "/api/status" },\n'
+        "\t\tValidator: validateKey,\n"
+        "\t}))\n"
+        '\tapi.POST("/status", status)\n'
+        '\tapi.POST("/jobs", createJob)\n'
+        "}\n",
+    )
+    # The skipper sees the full path (group prefix + route path).
+    assert routes["POST /status"].auth == "anonymous"
+    assert routes["POST /jobs"].auth == "required"
+    assert routes["POST /jobs"].guards == ["middleware.KeyAuthWithConfig"]
+
+
+def test_fiber_use_order_and_unknowable_configs(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/gofiber/fiber/v2"\n\n'
+        "func main() {\n"
+        "\tapp := fiber.New()\n"
+        '\tapp.Post("/ping", ping)\n'
+        '\tapp.Use(jwtware.New(jwtware.Config{SigningKey: jwtware.SigningKey{Key: []byte("s")}}))\n'
+        '\tapp.Post("/items", createItem)\n'
+        '\tv2 := fiber.New()\n'
+        '\tv2.Use(keyauth.New(keyCfg))\n'
+        '\tv2.Post("/things", createThing)\n'
+        '\tv3 := fiber.New()\n'
+        "\tv3.Use(jwtware.New(jwtware.Config{Filter: skipPublic}))\n"
+        '\tv3.Post("/widgets", createWidget)\n'
+        "}\n",
+    )
+    # fiber runs middleware in registration order: /ping comes before the Use.
+    assert routes["POST /ping"].auth == "unknown"
+    assert routes["POST /items"].auth == "required"
+    # A config passed by variable, or a named skip function, could skip anything.
+    assert routes["POST /things"].auth == "unknown"
+    assert routes["POST /widgets"].auth == "unknown"

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route-level auth (#7, AttackMap#256)
+
+- **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the middleware and `guard_evidence` quoting the registration that attached it. AttackMap ≥ 0.6 trusts it over its own resolution, which can't read Go, and over the ±40-line auth-hint window. Older cores ignore the fields, and the existing auth hints are unchanged.
+- **Resolved:** chi `r.Use(mw)`, `r.With(mw).Post(...)` and `r.Group(func(r chi.Router) {...})` / `r.Route("/x", ...)` closures; gin `r.Group("/x", mw...)`, `group.Use(mw)` and `r.POST(path, mw..., h)`; echo `e.Group("/x", mw...)`, `Use` and `e.POST(path, h, mw...)`; fiber `app.Use(mw)`, `app.Use("/prefix", mw)`, `app.Group("/x", mw...)` and `app.Post(path, mw..., h)`. `Use` applies only to routes registered after it. A router passed in as a parameter is tracked within its function.
+- **Explicit opt-outs:** a guard's `Skipper` / `Next` / `Filter` that only compares the request path with literals makes the routes it names `anonymous`, at either app or group level. Any other skipper, a config passed by variable, `jwtauth.Verifier` alone and `Optional*` middleware leave routes `unknown`.
+- `r.With(mw...).Post("/x", h)` registrations in chi files are now extracted as routes. They were missed before.
+- Brackets are matched in one cached pass per file, arguments are split by jumping over nested closures, and binding lookups, `Use` lists and derivation depth are bounded, so adversarial input stays linear.
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk.fs` helpers
