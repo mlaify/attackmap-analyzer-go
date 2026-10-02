@@ -6,6 +6,7 @@ resulting ScanResult. Line-number assertions verify the Signal v2 plumbing.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -492,3 +493,48 @@ def test_full_gin_service_produces_expected_signal_set(tmp_path: Path) -> None:
     jwt_secret = next(s for s in result.secret_hints if s.name == "JWT_SECRET")
     assert jwt_secret.line is not None
     assert jwt_secret.confidence == 0.85
+
+
+# ---------- Repo walking (mlaify/AttackMap#253) ----------
+
+
+def _write_gin_main(repo: Path) -> Path:
+    repo.mkdir(parents=True, exist_ok=True)
+    main = repo / "main.go"
+    main.write_text(
+        'package main\n'
+        '\n'
+        'import "github.com/gin-gonic/gin"\n'
+        '\n'
+        'func main() {\n'
+        '    r := gin.Default()\n'
+        '    r.GET("/users", listUsers)\n'
+        '    r.Run(":8080")\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    return main
+
+
+def test_repo_under_skip_dir_names_is_still_analyzed(tmp_path: Path) -> None:
+    # "build" and "out" are skip dirs; they must only count inside the repo.
+    repo = tmp_path / "build" / "out" / "repo"
+    _write_gin_main(repo)
+    analyzer = GoAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert ("/users", "GET") in {(r.path, r.method) for r in result.routes}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    target = _write_gin_main(tmp_path / "outside")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "linked.go").symlink_to(target)
+    analyzer = GoAnalyzer()
+    assert analyzer.detect(repo) is False
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 0
+    assert result.routes == []

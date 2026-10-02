@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -33,7 +35,9 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".go"}
-SKIP_DIRS = {"vendor", ".git", "node_modules", "dist", "build"}
+# vendor/, .git, node_modules, dist and build are all in the SDK defaults, which
+# are matched against directory names inside the repo only (mlaify/AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS
 SKIP_SUFFIXES = {"_test.go"}  # Go test files — keep as low-quality input
 _SNIPPET_MAX_CHARS = 160
 
@@ -154,12 +158,10 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
+# Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
+# splits on "\n" only, so it stays consistent with line_of() on files that
+# contain form feeds or other str.splitlines() separators, and it costs
+# O(line) per match instead of O(file).
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
@@ -171,12 +173,9 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
-def _module_name_from_gomod(gomod_path: Path) -> str | None:
-    if not gomod_path.exists():
-        return None
-    try:
-        text = gomod_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _module_name_from_gomod(gomod_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(gomod_path, root=root)
+    if text is None:
         return None
     match = re.search(r"^\s*module\s+([^\s]+)\s*$", text, re.MULTILINE)
     if match:
@@ -237,15 +236,8 @@ class GoAnalyzer:
             return False
         if (root / "go.mod").exists() or (root / "go.sum").exists():
             return True
-        for path in root.rglob("go.mod"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            return True
-        for path in root.rglob("*.go"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            return True
-        return False
+        # Any nested go.mod or .go file; stop at the first one.
+        return next(iter_repo_files(root, suffixes=CODE_SUFFIXES, names={"go.mod"}, skip_dirs=SKIP_DIRS), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -253,26 +245,20 @@ class GoAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        module_name = _module_name_from_gomod(root / "go.mod")
+        module_name = _module_name_from_gomod(root / "go.mod", root)
         if module_name:
             self._append_unique_service(result, f"module:{module_name}", "go.mod")
 
-        for file_path in root.rglob("*.go"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path, root=root)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "go" not in result.languages:
                 result.languages.append("go")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -300,7 +286,7 @@ class GoAnalyzer:
         if is_gin or is_echo:
             for match in GIN_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(2).upper(), match.group(3)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Chi / fiber: title-case verb method (r.Get, app.Post, ...). Only run when
         # we know which framework is in this file; otherwise we'd mis-attribute
@@ -308,13 +294,13 @@ class GoAnalyzer:
         if is_chi or is_fiber:
             for match in CHI_ECHO_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(2).upper(), match.group(3)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # Gorilla/mux: HandleFunc + chained .Methods("GET", "POST")
         if is_gorilla:
             for match in GORILLA_HANDLEFUNC_PATTERN.finditer(content):
                 path = match.group(1)
-                line = _line_of(content, match.start())
+                line = line_of(content, match.start())
                 chain = match.group("chain") or ""
                 methods_match = GORILLA_METHODS_PATTERN.search(chain)
                 if methods_match:
@@ -331,7 +317,7 @@ class GoAnalyzer:
         if is_net_http and not is_gorilla:
             for match in NET_HTTP_HANDLEFUNC_PATTERN.finditer(content):
                 path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -340,7 +326,7 @@ class GoAnalyzer:
                 continue
             self._append_unique_database(
                 result, kind, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -351,7 +337,7 @@ class GoAnalyzer:
                 continue
             self._append_unique_auth(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -363,7 +349,7 @@ class GoAnalyzer:
                 name = groups[0] if groups and groups[0] else "unknown"
                 self._append_unique_secret(
                     result, name, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -375,7 +361,7 @@ class GoAnalyzer:
                     continue
                 self._append_unique_external(
                     result, target, relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -386,7 +372,7 @@ class GoAnalyzer:
                 continue
             self._append_unique_framework(
                 result, name, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -397,7 +383,7 @@ class GoAnalyzer:
                 continue
             self._append_unique_entrypoint(
                 result, hint, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
