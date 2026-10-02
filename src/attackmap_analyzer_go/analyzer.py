@@ -16,6 +16,7 @@ downstream insights can cite `path/to/file.go:NN`.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -38,7 +39,11 @@ CODE_SUFFIXES = {".go"}
 # vendor/, .git, node_modules, dist and build are all in the SDK defaults, which
 # are matched against directory names inside the repo only (mlaify/AttackMap#253).
 SKIP_DIRS = DEFAULT_SKIP_DIRS
-SKIP_SUFFIXES = {"_test.go"}  # Go test files — keep as low-quality input
+# The go tool ignores `testdata/` directories: they hold fixtures, never code
+# that ships. analyze() skips them along with `*_test.go` files unless test
+# code is opted in with ATTACKMAP_INCLUDE_TESTS.
+TEST_DATA_DIRS = frozenset({"testdata"})
+INCLUDE_TESTS_ENV = "ATTACKMAP_INCLUDE_TESTS"
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -52,8 +57,24 @@ GIN_ROUTE_PATTERN = re.compile(
 
 # Chi: r.Get("/path", h), r.Post("/path", h)
 # Title-case method (Chi convention). Same shape as Echo.
+#
+# Title-case `.Get(...)` is also the shape of every key/value lookup in Go
+# (`req.Header.Get("Authorization")`, `q.Get("id")`, `viper.Get("key")`, fiber's
+# `c.Get("X-Api-Key")`), so a registration must look like one: the path is a
+# string literal starting with `/` (chi panics on anything else; fiber's
+# catch-all `*` is the one exception) followed by a handler argument.
 CHI_ECHO_ROUTE_PATTERN = re.compile(
-    r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options)\(\s*"([^"]+)"',
+    r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options)\(\s*"([/*][^"]*)"\s*,',
+)
+
+# Receivers that are never routers: request accessors (`r.Header.Get`,
+# `r.URL.Query().Get`, `r.Form.Get`), config/env lookups, and the per-request
+# context (`c`/`ctx`) whose `.Get` reads a header or a context value.
+NON_ROUTER_RECEIVERS = frozenset(
+    {
+        "Header", "Query", "URL", "Form", "PostForm", "Trailer", "Values",
+        "Cookies", "Params", "viper", "os", "c", "ctx",
+    }
 )
 
 # Fiber: app.Get("/path", h)
@@ -249,7 +270,13 @@ class GoAnalyzer:
         if module_name:
             self._append_unique_service(result, f"module:{module_name}", "go.mod")
 
-        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+        # `*_test.go` and `testdata/` are test code: httptest registrations in
+        # them are not production routes (#2). ATTACKMAP_INCLUDE_TESTS opts in.
+        include_tests = bool(os.environ.get(INCLUDE_TESTS_ENV))
+        skip_dirs = SKIP_DIRS if include_tests else SKIP_DIRS | TEST_DATA_DIRS
+        for file_path in iter_repo_files(
+            root, suffixes=CODE_SUFFIXES, skip_dirs=skip_dirs, include_tests=include_tests
+        ):
             content = read_source(file_path, root=root)
             if content is None:
                 continue
@@ -293,6 +320,8 @@ class GoAnalyzer:
         # generic `.Get(...)` calls on non-router types.
         if is_chi or is_fiber:
             for match in CHI_ECHO_ROUTE_PATTERN.finditer(content):
+                if match.group(1) in NON_ROUTER_RECEIVERS:
+                    continue
                 method, path = match.group(2).upper(), match.group(3)
                 self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
