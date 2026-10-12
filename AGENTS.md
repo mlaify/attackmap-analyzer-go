@@ -25,7 +25,7 @@ Go ecosystem coverage:
 - **Service hints**: module name from `go.mod`
 
 ## Out of scope (for now)
-- chi `r.Route("/api", ...)` / `r.Mount(...)` prefix nesting — inner routes extract, outer prefix is not joined.
+- Router prefixes set up in another function or file (`users.Register(v1.Group("/users"))`, a `Mount` of another package's router) — routes extract relative to the router they are registered on.
 - gRPC route extraction from `.proto` / generated code — only framework presence + server-startup are detected.
 - Custom `http.Client` instances with URL constructed elsewhere — only literal-URL HTTP calls are picked up.
 

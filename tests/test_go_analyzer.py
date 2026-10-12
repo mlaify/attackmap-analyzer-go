@@ -682,11 +682,11 @@ def test_gin_route_group_and_use_guards_are_required(tmp_path: Path) -> None:
     assert comments.auth == "required"
     assert comments.guards == ["AuthRequired"]
     assert comments.guard_evidence == 'r.POST("/comments", AuthRequired(), createComment)'
-    assert routes["DELETE /users/:id"].guards == ["gin.BasicAuth"]
-    assert routes["PUT /profile"].auth == "required"
-    assert routes["PUT /profile"].guard_evidence == "api.Use(AuthRequired())"
+    assert routes["DELETE /admin/users/:id"].guards == ["gin.BasicAuth"]
+    assert routes["PUT /api/profile"].auth == "required"
+    assert routes["PUT /api/profile"].guard_evidence == "api.Use(AuthRequired())"
     # gin copies a group's middleware at registration: an earlier route isn't guarded.
-    assert routes["POST /early"].auth == "unknown"
+    assert routes["POST /api/early"].auth == "unknown"
     assert routes["POST /login"].auth == "unknown"
     assert routes["POST /login"].guard_evidence is None
 
@@ -719,7 +719,7 @@ def test_chi_use_group_and_with_guards(tmp_path: Path) -> None:
     assert routes["DELETE /orders/{id}"].auth == "required"
     assert routes["POST /signup"].auth == "unknown"
     # jwtauth.Verifier only parses a token; it doesn't reject anonymous callers.
-    assert routes["POST /feedback"].auth == "unknown"
+    assert routes["POST /public/feedback"].auth == "unknown"
 
 
 def test_router_passed_as_parameter_keeps_its_use_guard(tmp_path: Path) -> None:
@@ -783,9 +783,9 @@ def test_group_guard_skipper_opts_one_route_out(tmp_path: Path) -> None:
         "}\n",
     )
     # The skipper sees the full path (group prefix + route path).
-    assert routes["POST /status"].auth == "anonymous"
-    assert routes["POST /jobs"].auth == "required"
-    assert routes["POST /jobs"].guards == ["middleware.KeyAuthWithConfig"]
+    assert routes["POST /api/status"].auth == "anonymous"
+    assert routes["POST /api/jobs"].auth == "required"
+    assert routes["POST /api/jobs"].guards == ["middleware.KeyAuthWithConfig"]
 
 
 def test_fiber_use_order_and_unknowable_configs(tmp_path: Path) -> None:
@@ -812,3 +812,400 @@ def test_fiber_use_order_and_unknowable_configs(tmp_path: Path) -> None:
     # A config passed by variable, or a named skip function, could skip anything.
     assert routes["POST /things"].auth == "unknown"
     assert routes["POST /widgets"].auth == "unknown"
+
+
+# ---------- Route shapes: ServeMux patterns, Handle, gorilla chains, prefixes (#3) ----------
+
+
+def _scan(tmp_path: Path, name: str, source: str):
+    (tmp_path / name).write_text(source, encoding="utf-8")
+    return GoAnalyzer().analyze(tmp_path)
+
+
+def test_servemux_method_and_host_patterns(tmp_path: Path) -> None:
+    result = _scan(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "net/http"\n\n'
+        "func main() {\n"
+        "\tmux := http.NewServeMux()\n"
+        '\tmux.HandleFunc("GET /items/{id}", getItem)\n'
+        '\tmux.HandleFunc("POST example.com/x", postX)\n'
+        '\tmux.HandleFunc("DELETE\t/items/{id...}", deleteItem)\n'
+        "\tmux.HandleFunc(`PUT /raw/{id}`, putRaw)\n"
+        '\tmux.HandleFunc("/legacy", legacy)\n'
+        '\tmux.HandleFunc("get /lower", lower)\n'
+        '\tbus.Handle("event/created", onCreated)\n'
+        '\thttp.ListenAndServe(":8080", mux)\n'
+        "}\n",
+    )
+    pairs = {(r.method, r.path) for r in result.routes}
+    assert pairs == {
+        ("GET", "/items/{id}"),
+        ("POST", "/x"),
+        ("DELETE", "/items/{id...}"),
+        ("PUT", "/raw/{id}"),
+        ("ANY", "/legacy"),
+    }
+    # The host is kept as evidence of a host-scoped route.
+    host = [h for h in result.service_hints if h.hint == "route_host:example.com"]
+    assert len(host) == 1
+    assert host[0].line == 8
+    assert host[0].evidence_text == 'mux.HandleFunc("POST example.com/x", postX)'
+
+
+def test_servemux_handle_routes_and_wrapped_auth(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "net/http"\n\n'
+        "func main() {\n"
+        "\tmux := http.NewServeMux()\n"
+        '\tmux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web"))))\n'
+        '\tmux.Handle("POST /admin/reset", requireAuth(http.HandlerFunc(reset)))\n'
+        '\tmux.Handle("POST /login", auth.LoginHandler(db))\n'
+        '\tmux.Handle("POST /hook", authHandler)\n'
+        '\thttp.Handle("/", mux)\n'
+        '\thttp.ListenAndServe(":8080", nil)\n'
+        "}\n",
+    )
+    assert set(routes) == {"ANY /static/", "POST /admin/reset", "POST /login", "POST /hook"}
+    assert routes["POST /admin/reset"].auth == "required"
+    assert routes["POST /admin/reset"].guards == ["requireAuth"]
+    # A handler constructor in an auth package, or a bare handler named for
+    # auth, isn't middleware.
+    assert routes["POST /login"].auth == "unknown"
+    assert routes["POST /hook"].auth == "unknown"
+
+
+def test_gorilla_closure_wrapped_and_handle_routes(tmp_path: Path) -> None:
+    """The issue's fixture: only `GET /a` came out before."""
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport (\n\t"net/http"\n\n\t"github.com/gorilla/mux"\n)\n\n'
+        "func main() {\n"
+        "\tr := mux.NewRouter()\n"
+        '\tr.HandleFunc("/a", a).Methods("GET")\n'
+        '\tr.HandleFunc("/b", func(w http.ResponseWriter, req *http.Request) {\n'
+        '\t\tif req.Method == "POST" { w.WriteHeader(201) }\n'
+        '\t}).Methods("POST")\n'
+        '\tr.HandleFunc("/c", authMW(c)).Methods(http.MethodPut, http.MethodPatch)\n'
+        '\tr.Handle("/d", d).Methods("DELETE")\n'
+        '\tr.Path("/e").Methods("GET").HandlerFunc(e)\n'
+        '\tr.PathPrefix("/static/").Handler(http.FileServer(http.Dir("web")))\n'
+        "\tr.HandleFunc(`/raw`, raw)\n"
+        '\tr.HandleFunc(path, dynamic)\n'
+        '\thttp.Handle("/", r)\n'
+        "}\n",
+    )
+    assert set(routes) == {
+        "GET /a", "POST /b", "PUT /c", "PATCH /c", "DELETE /d", "GET /e", "ANY /static/", "ANY /raw",
+    }
+    assert routes["PUT /c"].auth == "required"
+    assert routes["PUT /c"].guards == ["authMW"]
+    assert routes["GET /a"].auth == "unknown"
+    assert routes["POST /b"].line == 12
+
+
+def test_gorilla_subrouter_prefix_and_use_guards(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/gorilla/mux"\n\n'
+        "func main() {\n"
+        "\tr := mux.NewRouter()\n"
+        '\tr.HandleFunc("/health", health)\n'
+        '\tapi := r.PathPrefix("/api").Subrouter()\n'
+        '\tapi.HandleFunc("/users", listUsers).Methods("GET")\n'
+        "\tapi.Use(jwtMiddleware)\n"
+        '\tv1 := api.PathPrefix("/v1").Methods("POST").Subrouter()\n'
+        '\tv1.HandleFunc("/orders", createOrder).Methods("POST")\n'
+        '\tpub := r.Host("{sub}.example.com").Subrouter()\n'
+        '\tpub.HandleFunc("/feed", feed)\n'
+        '\tdyn := r.PathPrefix(base).Subrouter()\n'
+        '\tdyn.HandleFunc("/x", x)\n'
+        "}\n",
+    )
+    assert set(routes) == {"ANY /health", "GET /api/users", "POST /api/v1/orders", "ANY /feed", "ANY /x"}
+    # gorilla runs a router's middleware for all of its routes, whenever registered.
+    assert routes["GET /api/users"].auth == "required"
+    assert routes["GET /api/users"].guard_evidence == "api.Use(jwtMiddleware)"
+    assert routes["POST /api/v1/orders"].auth == "required"
+    assert routes["ANY /health"].auth == "unknown"
+    assert routes["ANY /feed"].auth == "unknown"
+
+
+def test_gin_nested_group_prefixes_and_group_use(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func main() {\n"
+        "\tr := gin.Default()\n"
+        '\tv1 := r.Group("/api/v1")\n'
+        "\t{\n"
+        '\t\tusers := v1.Group("/users")\n'
+        '\t\tusers.GET("", listUsers)\n'
+        '\t\tusers.GET("/:id", getUser)\n'
+        '\t\tadmin := v1.Group("/admin/")\n'
+        "\t\tadmin.Use(AuthRequired())\n"
+        '\t\tadmin.POST("/reset", reset)\n'
+        "\t}\n"
+        "\tr.GET(`/raw`, raw)\n"
+        '\tr.GET("", ignored)\n'
+        "}\n",
+    )
+    assert set(routes) == {"GET /api/v1/users", "GET /api/v1/users/:id", "POST /api/v1/admin/reset", "GET /raw"}
+    assert routes["POST /api/v1/admin/reset"].auth == "required"
+    assert routes["GET /api/v1/users"].auth == "unknown"
+
+
+def test_echo_group_prefix_carries_group_middleware(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport (\n\t"github.com/labstack/echo/v4"\n\t"github.com/labstack/echo/v4/middleware"\n)\n\n'
+        "func main() {\n"
+        "\te := echo.New()\n"
+        '\tadmin := e.Group("/admin", middleware.JWT([]byte("secret")))\n'
+        '\tadmin.POST("/reset", reset)\n'
+        '\tusers := admin.Group("/users")\n'
+        '\tusers.DELETE("/:id", deleteUser)\n'
+        '\tpublic := e.Group("/public")\n'
+        '\tpublic.POST("/contact", contact)\n'
+        "}\n",
+    )
+    assert set(routes) == {"POST /admin/reset", "DELETE /admin/users/:id", "POST /public/contact"}
+    assert routes["POST /admin/reset"].auth == "required"
+    assert routes["DELETE /admin/users/:id"].guards == ["middleware.JWT"]
+    assert routes["POST /public/contact"].auth == "unknown"
+
+
+def test_fiber_group_and_route_prefixes(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "github.com/gofiber/fiber/v2"\n\n'
+        "func main() {\n"
+        "\tapp := fiber.New()\n"
+        '\tapi := app.Group("/api")\n'
+        '\tv1 := api.Group("/v1", jwtware.New(jwtware.Config{SigningKey: jwtware.SigningKey{Key: key}}))\n'
+        '\tv1.Get("/list", list)\n'
+        '\tapi.Post("/ping", ping)\n'
+        '\tapp.Route("/shop", func(router fiber.Router) {\n'
+        '\t\trouter.Get("/items", items)\n'
+        '\t})\n'
+        "}\n",
+    )
+    assert set(routes) == {"GET /api/v1/list", "POST /api/ping", "GET /shop/items"}
+    assert routes["GET /api/v1/list"].auth == "required"
+    assert routes["POST /api/ping"].auth == "unknown"
+
+
+_CHI_HEADER = 'package server\n\nimport (\n\t"net/http"\n\n\t"github.com/go-chi/chi/v5"\n)\n\n'
+
+
+def test_chi_route_closure_prefix_and_auth(tmp_path: Path) -> None:
+    """The issue's repro: `r.Route("/admin", ...) { r.Post("/reset") }` came out as `POST /reset`."""
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes() http.Handler {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.Route("/admin", func(r chi.Router) {\n'
+        "\t\tr.Use(jwtauth.Authenticator(ta))\n"
+        '\t\tr.Post("/reset", reset)\n'
+        '\t\tr.Route("/users/{id}", func(r chi.Router) {\n'
+        '\t\t\tr.Delete("/", deleteUser)\n'
+        '\t\t\tr.Method("PUT", "/role", setRole)\n'
+        '\t\t\tr.Handle("/metrics", metrics)\n'
+        "\t\t})\n"
+        "\t})\n"
+        '\tr.Post("/signup", signup)\n'
+        '\tr.Post(`/wrapped`, requireAuth(wrapped))\n'
+        "\treturn r\n"
+        "}\n",
+    )
+    assert set(routes) == {
+        "POST /admin/reset", "DELETE /admin/users/{id}/", "PUT /admin/users/{id}/role",
+        "ANY /admin/users/{id}/metrics", "POST /signup", "POST /wrapped",
+    }
+    for key in ("POST /admin/reset", "DELETE /admin/users/{id}/", "PUT /admin/users/{id}/role", "ANY /admin/users/{id}/metrics"):
+        assert routes[key].auth == "required", key
+        assert routes[key].guards == ["jwtauth.Authenticator"]
+    assert routes["POST /signup"].auth == "unknown"
+    assert routes["POST /wrapped"].auth == "required"
+
+
+def test_chi_mount_prefixes(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes(h *Handler) http.Handler {\n"
+        "\tr := chi.NewRouter()\n"
+        "\tr.Use(jwtauth.Authenticator(ta))\n"
+        '\tr.Mount("/api", apiRouter())\n'
+        '\tr.Mount("/things", h.Routes())\n'
+        '\tr.Route("/users", userRoutes)\n'
+        "\tsub := chi.NewRouter()\n"
+        '\tsub.Get("/ping", ping)\n'
+        '\tr.Mount("/sub", sub)\n'
+        '\tr.Mount("/debug", middleware.Profiler())\n'
+        "\treturn r\n"
+        "}\n\n"
+        "func apiRouter() http.Handler {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.Get("/items", listItems)\n'
+        "\treturn r\n"
+        "}\n\n"
+        "func (h *Handler) Routes() chi.Router {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.Post("/", h.create)\n'
+        "\treturn r\n"
+        "}\n\n"
+        "func userRoutes(r chi.Router) {\n"
+        '\tr.Get("/{id}", getUser)\n'
+        "}\n",
+    )
+    assert set(routes) == {"GET /api/items", "POST /things/", "GET /users/{id}", "GET /sub/ping"}
+    # The parent's middleware runs before the mounted router's routes.
+    for route in routes.values():
+        assert route.auth == "required", route.path
+
+
+def test_chi_mount_ambiguous_or_cyclic_keeps_route_path(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes() http.Handler {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.Get("/root", root)\n'
+        "\tsub := chi.NewRouter()\n"
+        '\tsub.Get("/ping", ping)\n'
+        '\tr.Mount("/a", sub)\n'
+        '\tr.Mount("/b", sub)\n'
+        '\tr.Mount("/self", r)\n'
+        "\tloop := chi.NewRouter()\n"
+        '\tloop.Get("/x", x)\n'
+        '\tsub.Mount("/loop", loop)\n'
+        '\tloop.Mount("/back", sub)\n'
+        "\treturn r\n"
+        "}\n",
+    )
+    # Mounted at two prefixes: the route's own path, not a wrong one. A router
+    # mounted into itself or its own subtree isn't re-parented.
+    assert set(routes) == {"GET /root", "GET /ping", "GET /loop/x"}
+
+
+def test_parameterless_group_closures_join_prefixes_only(tmp_path: Path) -> None:
+    """gitea-style group-stack router: `m.Group("/x", func() {...}, mw...)`."""
+    routes = _routes(
+        tmp_path,
+        "web.go",
+        _CHI_HEADER + "func Routes(m *web.Router) {\n"
+        '\tm.Group("/repos", func() {\n'
+        '\t\tm.Get("/{id}", getRepo)\n'
+        '\t\tm.Group("/{id}/settings", func() {\n'
+        '\t\t\tm.Post("/delete", deleteRepo)\n'
+        "\t\t}, reqRepoAdmin, webAuth.AllowBasic)\n"
+        '\t\tm.Get("/{id}/stars", stars)\n'
+        "\t}, checkTokenPublicOnly())\n"
+        '\tm.Get("/explore", explore)\n'
+        "}\n",
+    )
+    assert set(routes) == {"GET /repos/{id}", "POST /repos/{id}/settings/delete", "GET /repos/{id}/stars", "GET /explore"}
+    # The wrapper's middleware semantics are unknown: no auth is declared.
+    assert all(r.auth == "unknown" for r in routes.values())
+
+
+def test_many_sibling_scopes_still_resolve(tmp_path: Path) -> None:
+    """Hundreds of closed group scopes of the same router name are skipped, not walked."""
+    groups = "".join(f'\tm.Group("/g{i}", func() {{\n\t\tm.Get("/x", h)\n\t}})\n' for i in range(400))
+    routes = _routes(
+        tmp_path,
+        "web.go",
+        _CHI_HEADER + "func Routes(m *web.Router) {\n" + groups + '\tm.Group("/late", func() {\n\t\tm.Post("/y", y)\n\t})\n}\n',
+    )
+    assert "POST /late/y" in routes
+    assert "GET /g399/x" in routes
+    assert len(routes) == 401
+
+
+def _fuzz_sources() -> list[str]:
+    """Route-heavy sources for the fuzz test: every shape this analyzer reads."""
+    return [
+        _CHI_HEADER + 'func R() {\n\tr := chi.NewRouter()\n\tr.Route("/a", func(r chi.Router) {\n'
+        '\t\tr.Use(jwtauth.Authenticator(ta))\n\t\tr.Post(`/b`, requireAuth(h))\n\t\tr.Mount("/c", sub())\n\t})\n'
+        '\tr.Route("/u", userRoutes)\n\tr.With(authMW).Get("/w", h)\n\tm.Group("/g", func() {\n\t\tm.Get("/x", h)\n\t}, mw)\n}\n'
+        "func sub() http.Handler {\n\tr := chi.NewRouter()\n\tr.Get(\"/s\", h)\n\treturn r\n}\n"
+        "func userRoutes(r chi.Router) {\n\tr.Get(\"/{id}\", h)\n}\n",
+        'package main\n\nimport (\n\t"net/http"\n\t"github.com/gorilla/mux"\n)\n\nfunc main() {\n\tr := mux.NewRouter()\n'
+        '\tapi := r.PathPrefix("/api").Subrouter()\n\tapi.Use(authMW)\n'
+        '\tapi.HandleFunc("/b", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("}")) }).Methods("POST")\n'
+        '\tr.Path("/e").Methods(http.MethodGet).HandlerFunc(requireAuth(e))\n\thttp.Handle("/", r)\n}\n',
+        'package main\n\nimport "net/http"\n\nfunc main() {\n\tmux := http.NewServeMux()\n'
+        '\tmux.HandleFunc("GET example.com/items/{id}", h) // "unterminated `raw\n'
+        '\tmux.Handle("/x", requireAuth(h))\n\t/* { ( */\n}\n',
+        'package main\n\nimport "github.com/gin-gonic/gin"\n\nfunc main() {\n\tr := gin.Default()\n'
+        '\tv1 := r.Group("/v1", AuthRequired())\n\t{\n\t\tu := v1.Group("/u")\n\t\tu.Use(AuthRequired())\n'
+        '\t\tu.GET("", h)\n\t}\n}\n',
+    ]
+
+
+def test_route_extraction_survives_garbage_and_truncation() -> None:
+    """Truncated, bracket-shuffled and random input must never raise."""
+    import random
+    import time
+
+    from attackmap_analyzer_go.contracts import ScanResult
+
+    analyzer = GoAnalyzer()
+    rng = random.Random(1234)
+    vocab = [
+        "{", "}", "(", ")", "[", "]", '"', "`", "'", ",", ".", "\n", " ", "//", "/*", "*/", "func()",
+        "func(r chi.Router)", "r", "m", "sub", ":=", "=", "r.Route(", "r.Mount(", "m.Group(", ".Subrouter()",
+        ".PathPrefix(", ".HandleFunc(", ".Handle(", ".Methods(", ".Use(", ".Get(", ".GET(", '"/x"', "`/y`",
+        '"GET /z"', "chi.NewRouter()", "mux.NewRouter()", "gin.Default()", "authMW(h)", "requireAuth(", "go-chi/chi",
+        "gorilla/mux", "net/http", "gin-gonic/gin", "fiber.New()", "echo.New()",
+    ]
+    start = time.monotonic()
+    for source in _fuzz_sources():
+        for cut in range(0, len(source), 7):
+            analyzer._extract_routes(source[:cut], "f.go", ScanResult(root="."))
+        for _ in range(60):
+            chars = list(source)
+            for _ in range(rng.randint(1, 8)):
+                i = rng.randrange(len(chars))
+                chars[i] = rng.choice("{}()[]\"`'\n")
+            analyzer._extract_routes("".join(chars), "f.go", ScanResult(root="."))
+    for _ in range(300):
+        soup = "".join(rng.choice(vocab) for _ in range(rng.randint(1, 400)))
+        analyzer._extract_routes(soup, "f.go", ScanResult(root="."))
+    assert time.monotonic() - start < 60
+
+
+def test_route_scopes_stay_linear_on_adversarial_nesting() -> None:
+    import time
+
+    from attackmap_analyzer_go.contracts import ScanResult
+
+    depth = 2000
+    nested = (
+        _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n"
+        + '\tr.Route("/a", func(r chi.Router) {\n' * depth
+        + '\tr.Get("/x", h)\n'
+        + "\t})\n" * depth
+        + "}\n"
+    )
+    unbalanced = _CHI_HEADER + 'func R() {\n' + '\tm.Group("/g", func() {\n\t\tm.Get("/x", h)\n' * 3000
+    mounts = _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + '\tr.Mount("/m", r)\n\tr.Route("/r", R)\n' * 3000 + "}\n"
+    for source in (nested, unbalanced, mounts):
+        result = ScanResult(root=".")
+        start = time.monotonic()
+        GoAnalyzer()._extract_routes(source, "f.go", result)
+        assert time.monotonic() - start < 10
+    # Derivation deeper than the walk limit keeps the path we could join.
+    result = ScanResult(root=".")
+    GoAnalyzer()._extract_routes(nested, "f.go", result)
+    assert len(result.routes) == 1 and result.routes[0].path.endswith("/a/x")

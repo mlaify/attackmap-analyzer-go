@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route shapes and group prefixes (#3)
+
+- **Go 1.22 ServeMux patterns.** `mux.HandleFunc("GET /items/{id}", h)` is `GET /items/{id}` (it was path `"GET /items/{id}"`, method `ANY`). A host (`"POST example.com/x"`) is kept as a `route_host:example.com` service hint quoting the registration; the route is `POST /x`.
+- **`Handle` routes.** `mux.Handle(...)` / `http.Handle(...)` (FileServer, wrapped handlers) are emitted for net/http, and `r.Handle(...)` for gorilla. `http.Handle("/", r)` serving a router built in the same file isn't a route of its own.
+- **gorilla/mux chains.** The handler can be anything (a closure, `authMW(h)`); the chain is read call by call with balanced-bracket scanning, so `r.HandleFunc("/b", func(...) {...}).Methods("POST")`, `r.Path("/e").Methods("GET").HandlerFunc(h)`, `r.PathPrefix("/static/").Handler(fs)` and `.Methods(http.MethodPut)` all work. The issue's fixture (`/a` named, `/b` closure, `/c` wrapped, `/d` Handle) went from 1 route to 4.
+- **Group and sub-router prefixes are joined.** gin / echo / fiber `g := r.Group("/api")` (nested), chi `r.Route("/admin", func(r chi.Router) {...})` and `r.Route("/admin", adminRoutes)`, chi / fiber `r.Mount("/admin", sub | adminRouter() | h.Routes())` with the router built in the same file, fiber `app.Route(...)`, gorilla `r.PathPrefix("/api").Subrouter()`, and gitea-style parameterless `m.Group("/x", func() {...})` closures. A non-literal prefix stops the join; a router mounted at two prefixes keeps its own paths.
+- **Group middleware carries its auth.** A guard attached to a group, sub-router or mounting router (`admin.Use(AuthRequired())`, `e.Group("/admin", middleware.JWT(...))`, chi `r.Use(...)` before `r.Mount(...)`) applies to the routes in it, as before for same-router groups. gorilla `Use` applies to every route of the router and its subrouters regardless of order, as gorilla runs it. A handler wrapped in middleware-shaped auth (`requireAuth(h)`, `authMW(h)`, `jwtMiddleware.Handler(h)`) is guarded for net/http, gorilla and chi routes. Middleware passed to a parameterless group closure is not read (its semantics belong to the project's own wrapper).
+- chi `r.Method("GET", "/x", h)` / `MethodFunc` registrations, and raw-string (backtick) path literals everywhere.
+- Router lookups climb enclosing blocks instead of walking sibling ones, so a function with hundreds of groups (gitea's `routers/web/web.go`) still resolves every route. Path literals are bounded to one line, and chains, mounts and derivation depth are bounded, so adversarial input stays linear (fuzz-tested).
+
 ### Added — route-level auth (#7, AttackMap#256)
 
 - **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the middleware and `guard_evidence` quoting the registration that attached it. AttackMap ≥ 0.6 trusts it over its own resolution, which can't read Go, and over the ±40-line auth-hint window. Older cores ignore the fields, and the existing auth hints are unchanged.
