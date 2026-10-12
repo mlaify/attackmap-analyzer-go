@@ -1289,25 +1289,80 @@ def test_wrapper_guard_needs_a_middleware_shaped_call(tmp_path: Path) -> None:
         assert routes[key].auth == "required", key
 
 
-def test_large_files_stay_linear(tmp_path: Path) -> None:
-    """Many mounts of builder functions, and many routes in one file."""
+def _best_seconds(run, repeat: int = 3) -> float:
     import time
 
+    best = float("inf")
+    for _ in range(repeat):
+        start = time.perf_counter()
+        run()
+        best = min(best, time.perf_counter() - start)
+    return max(best, 1e-3)
+
+
+def _ratio(make, small: int) -> float:
+    """Cost of 4x the input over the input: ~4 when linear, ~16 when quadratic.
+    Measured as a ratio so a slow runner doesn't matter."""
     from attackmap_analyzer_go.contracts import ScanResult
 
-    mounts = (
-        _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n"
-        + "".join(f'\tr.Mount("/m{i}", build{i}())\n' for i in range(20000))
-        + "}\n"
-        + "".join(f"func build{i}() http.Handler {{\n\tr := chi.NewRouter()\n\tr.Get(\"/x\", h)\n\treturn r\n}}\n" for i in range(20000))
+    small_src, large_src = make(small), make(4 * small)
+    return _best_seconds(lambda: GoAnalyzer()._extract_routes(large_src, "f.go", ScanResult(root="."))) / _best_seconds(
+        lambda: GoAnalyzer()._extract_routes(small_src, "f.go", ScanResult(root="."))
     )
-    routes = _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + "".join(f'\tr.Get("/r{i}", h)\n' for i in range(16000)) + "}\n"
-    for source, expected in ((mounts, 20000), (routes, 16000)):
+
+
+def _mounts(n: int) -> str:
+    return (
+        _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n"
+        + "".join(f'\tr.Mount("/m{i}", build{i}())\n' for i in range(n))
+        + "}\n"
+        + "".join(f"func build{i}() http.Handler {{\n\tr := chi.NewRouter()\n\tr.Get(\"/x\", h)\n\treturn r\n}}\n" for i in range(n))
+    )
+
+
+def _same_named_methods(n: int) -> str:
+    return (
+        _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n"
+        + "".join(f'\tr.Mount("/m{i}", h{i}.Routes())\n' for i in range(n))
+        + "}\n"
+        + "".join(f"func (h *H{i}) Routes() chi.Router {{\n\tr := chi.NewRouter()\n\tr.Get(\"/x\", h.x)\n\treturn r\n}}\n" for i in range(n))
+    )
+
+
+def _many_routes(n: int) -> str:
+    return _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + "".join(f'\tr.Get("/r{i}", h)\n' for i in range(n)) + "}\n"
+
+
+def test_large_files_stay_linear() -> None:
+    """Many mounts of builder functions, many same-named methods (`h.Routes()`),
+    and many routes in one file."""
+    from attackmap_analyzer_go.contracts import ScanResult
+
+    result = ScanResult(root=".")
+    GoAnalyzer()._extract_routes(_mounts(2000), "f.go", result)
+    assert len(result.routes) == 2000 and result.routes[0].path == "/m0/x"
+    for make, small in ((_mounts, 2000), (_same_named_methods, 2000), (_many_routes, 4000)):
+        ratio = _ratio(make, small)
+        assert ratio < 9, (make.__name__, ratio)
+
+
+def test_many_files_stay_linear() -> None:
+    """The per-file route index starts empty, rather than being rebuilt from
+    every route of the files before (quadratic across a large repo)."""
+    from attackmap_analyzer_go.contracts import ScanResult
+
+    source = _many_routes(4)
+
+    def run(files: int) -> ScanResult:
         result = ScanResult(root=".")
-        start = time.monotonic()
-        GoAnalyzer()._extract_routes(source, "f.go", result)
-        assert time.monotonic() - start < 3
-        assert len(result.routes) == expected
+        analyzer = GoAnalyzer()
+        for i in range(files):
+            analyzer._extract_routes(source, f"r{i}.go", result)
+        return result
+
+    assert len(run(10).routes) == 40
+    ratio = _best_seconds(lambda: run(4000)) / _best_seconds(lambda: run(1000))
+    assert ratio < 9, ratio
 
 
 def test_guarded_group_route_has_no_unguarded_twin_end_to_end(tmp_path: Path) -> None:
@@ -1332,3 +1387,57 @@ def test_guarded_group_route_has_no_unguarded_twin_end_to_end(tmp_path: Path) ->
     scan = analyze_repository(tmp_path, analyzers=[DefaultAnalyzer(), GoAnalyzer()])
     assert [(r.method, r.path, r.auth) for r in scan.routes] == [("POST", "/api/users", "required")]
     assert unauthenticated_routes(scan, identify_attack_surfaces(scan)) == []
+
+
+
+def test_repeated_route_with_different_auth_is_unknown(tmp_path: Path) -> None:
+    """echo replaces the handler on a second registration, and chi prefers a
+    static route over a mount: neither registration's guard can be trusted."""
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport (\n\t"github.com/labstack/echo/v4"\n\t"github.com/labstack/echo/v4/middleware"\n)\n\n'
+        "func main() {\n"
+        "\te := echo.New()\n"
+        '\tadmin := e.Group("/admin", middleware.JWT([]byte("k")))\n'
+        '\tadmin.POST("/reset", reset)\n'
+        '\te.POST("/admin/reset", publicReset)\n'
+        '\tadmin.POST("/users", createUser)\n'
+        '\tadmin.POST("/users", createUser2)\n'
+        "}\n",
+    )
+    reset = routes["POST /admin/reset"]
+    assert (reset.auth, reset.guards, reset.guard_evidence) == ("unknown", [], None)
+    assert reset.line == 11
+    # The same guard both times stays required.
+    assert routes["POST /admin/users"].auth == "required"
+
+
+def test_router_served_directly_and_mounted_has_unknown_auth(tmp_path: Path) -> None:
+    for serve in (
+        'http.ListenAndServe(":8080", sub)',
+        'http.ListenAndServeTLS(":443", "c.pem", "k.pem", sub)',
+        'mux.Handle("/", sub)',
+        'mux.Handle("/v1/", http.StripPrefix("/v1", sub))',
+        "srv := &http.Server{Addr: addr, Handler: sub}",
+    ):
+        for name in tmp_path.iterdir():
+            name.unlink()
+        routes = _routes(
+            tmp_path,
+            "routes.go",
+            _CHI_HEADER + "func Routes() {\n"
+            "\tadmin := chi.NewRouter()\n"
+            "\tadmin.Use(AuthRequired)\n"
+            "\tsub := chi.NewRouter()\n"
+            '\tsub.Post("/items", createItem)\n'
+            '\tadmin.Mount("/x", sub)\n'
+            "\tmux := http.NewServeMux()\n"
+            f"\t{serve}\n"
+            "\tonly := chi.NewRouter()\n"
+            '\tonly.Post("/things", createThing)\n'
+            '\tadmin.Mount("/y", only)\n'
+            "}\n",
+        )
+        assert routes["POST /items"].auth == "unknown", serve
+        assert routes["POST /y/things"].auth == "required", serve

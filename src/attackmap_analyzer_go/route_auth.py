@@ -389,6 +389,15 @@ _FUNC_DEF = re.compile(
     re.MULTILINE,
 )
 _USE = re.compile(r"\b(\w+)\s*\.\s*Use\s*\(")
+# A router served on its own: `http.ListenAndServe(addr, api)` (or TLS),
+# `http.Server{Handler: api}`, `mux.Handle("/", api)` /
+# `mux.Handle("/api/", http.StripPrefix("/api", api))`. One that is also
+# mounted is reachable under two parents.
+_SERVED = re.compile(
+    r"\bhttp\s*\.\s*ListenAndServe(?:TLS)?\s*\((?:[^(),]{0,300},\s*){1,3}(\w+)\s*\)"
+    r"|\bHandler\s*:\s*(\w+)\s*[,}\n]"
+    r"|\b\w+\s*\.\s*Handle\s*\(\s*" + LIT + r"\s*,\s*(?:http\s*\.\s*StripPrefix\s*\(\s*" + LIT + r"\s*,\s*)?(\w+)\s*\)"
+)
 # chi `r.With(mw...).Route("/x", func(r chi.Router) {...})` / `.Group(func(r chi.Router) {...})`:
 # a closure router carrying the inline middleware. The chain is walked from `.With(`.
 _WITH = re.compile(r"\b(\w+)\s*\.\s*With\s*\(")
@@ -423,7 +432,7 @@ class FileRouters:
         self._free: dict[tuple[str, int], Binding] = {}
         self._roots: list[Binding] = []  # in offset order
         self._root_offsets: list[int] = []
-        self._funcs: dict[str, list[re.Match]] | None = None
+        self._funcs: dict[tuple[str, bool], list[re.Match]] | None = None
         mounts: list[re.Match] = []
         # Sweep state: blocks open at the current event offset.
         self._stack: list[tuple[int, int]] = []
@@ -454,6 +463,8 @@ class FileRouters:
         # Mounted routers are often built after the call, in a later function.
         for match in mounts:
             self._mount(match)
+        for match in _SERVED.finditer(content):
+            self._served(match)
 
     # -- scopes --
 
@@ -632,11 +643,12 @@ class FileRouters:
     def _function(self, name: str, method: bool) -> tuple[re.Match, tuple[int, int]] | None:
         """The one declaration of function (or method) ``name`` in this file
         and its body block; None when there are none or several."""
+        key = (name, method)
         if self._funcs is None:
             self._funcs = {}
             for match in _FUNC_DEF.finditer(self.content):
-                self._funcs.setdefault(match.group(2), []).append(match)
-        found = [m for m in self._funcs.get(name, []) if (m.group(1) is not None) == method]
+                self._funcs.setdefault((match.group(2), match.group(1) is not None), []).append(match)
+        found = self._funcs.get(key, [])  # keyed by (name, method): no rescan per lookup
         if len(found) != 1:
             return None
         index = bisect.bisect_left(self._top_starts, found[0].end())
@@ -689,6 +701,14 @@ class FileRouters:
             target.prefix, target.ambiguous = None, True
             return
         target.parent, target.prefix, target.link = parent, literal, match.start()
+
+    def _served(self, match: re.Match) -> None:
+        name = match.group(1) or match.group(2) or match.group(7)
+        target = self.resolve(name, match.start())
+        if target is not None and target.parent is not None:
+            # Mounted, and also served at the root: neither parent's prefix
+            # nor middleware is known to apply.
+            target.prefix, target.ambiguous = None, True
 
     # -- resolution --
 

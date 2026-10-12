@@ -355,8 +355,9 @@ class GoAnalyzer:
         is_gorilla = _file_is_gorilla_mux(content)
         is_net_http = _file_is_net_http(content)
         routers: list[ra.FileRouters] = []  # built on first use
-        # Route keys include the file, so this file's keys are all that can collide.
-        seen = {(r.path, r.method, r.file) for r in result.routes if r.file == relative}
+        # Route keys include the file and each file is read once, so a fresh
+        # index per file is complete: key -> the route's index in result.routes.
+        seen: dict[tuple[str, str, str], int] = {}
 
         def file_routers() -> ra.FileRouters:
             if not routers:
@@ -630,18 +631,26 @@ class GoAnalyzer:
         auth: str = ra.UNKNOWN,
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
-        seen: set[tuple[str, str, str]] | None = None,
+        seen: dict[tuple[str, str, str], int] | None = None,
     ) -> int | None:
         """Append a route once per (path, method, file); return its index, or
-        None when it was already recorded. ``seen`` holds the keys recorded so
-        far (the caller's, for one file), so a file with many routes stays
-        linear; without it the result's routes are scanned."""
+        None when it was already recorded. ``seen`` maps the keys recorded so
+        far (the caller's, for one file) to their index, so a file with many
+        routes stays linear; without it the result's routes are scanned.
+
+        A key registered again with a different auth becomes ``unknown``:
+        which registration serves the request depends on the framework (echo
+        replaces the handler, chi prefers a static route over a mount), so
+        neither guard can be trusted."""
         key = (path, method, file)
         if seen is not None:
-            if key in seen:
-                return None
-            seen.add(key)
-        elif any((item.path, item.method, item.file) == key for item in result.routes):
+            index = seen.get(key)
+        else:
+            index = next((i for i, r in enumerate(result.routes) if (r.path, r.method, r.file) == key), None)
+        if index is not None:
+            existing = result.routes[index]
+            if (existing.auth, existing.guards) != (auth, list(guards or [])) and existing.auth != ra.UNKNOWN:
+                result.routes[index] = Route(path=existing.path, method=existing.method, file=existing.file, line=existing.line)
             return None
         result.routes.append(
             Route(
@@ -649,6 +658,8 @@ class GoAnalyzer:
                 auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
             )
         )
+        if seen is not None:
+            seen[key] = len(result.routes) - 1
         return len(result.routes) - 1
 
     @staticmethod
