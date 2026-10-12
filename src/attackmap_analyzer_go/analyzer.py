@@ -50,10 +50,16 @@ _SNIPPET_MAX_CHARS = 160
 
 # ---------- Patterns ----------
 
+# Path literals: interpreted ("/x", no escapes) or raw (`/x`), on one line and
+# bounded, so an unterminated quote can't make a match scan the rest of the file.
+_LIT = ra.LIT
+_SLASH_LIT = r'(?:"([/*][^"\\\n]{0,511})"|`([/*][^`\n]{0,511})`)'
+
 # Gin: r.GET("/path", h), r.POST("/path", h), r.Group("/api")
-# Method must be uppercase verb (Gin convention).
+# Method must be uppercase verb (Gin convention). An empty path is the group's
+# own path (`users.GET("", list)`).
 GIN_ROUTE_PATTERN = re.compile(
-    r'\b(\w+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\(\s*"([^"]+)"',
+    r'\b(\w+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\(\s*' + _LIT,
 )
 
 # Chi: r.Get("/path", h), r.Post("/path", h)
@@ -65,7 +71,11 @@ GIN_ROUTE_PATTERN = re.compile(
 # string literal starting with `/` (chi panics on anything else; fiber's
 # catch-all `*` is the one exception) followed by a handler argument.
 CHI_ECHO_ROUTE_PATTERN = re.compile(
-    r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options)\(\s*"([/*][^"]*)"\s*,',
+    r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options)\(\s*' + _SLASH_LIT + r'\s*,',
+)
+# Chi: r.Method("GET", "/path", h) / r.MethodFunc(...).
+CHI_METHOD_PATTERN = re.compile(
+    r'\b(\w+)\s*\.\s*Method(?:Func)?\(\s*"([A-Z]+)"\s*,\s*' + _SLASH_LIT + r'\s*,',
 )
 
 # Chi inline middleware: r.With(mw...).Post("/path", h). The receiver's
@@ -73,7 +83,7 @@ CHI_ECHO_ROUTE_PATTERN = re.compile(
 CHI_WITH_PATTERN = re.compile(r"\b(\w+)\s*\.\s*With\s*\(")
 CHI_WITH_CHAIN_PATTERN = re.compile(r"\s*\.\s*With\s*\(")
 CHI_WITH_VERB_PATTERN = re.compile(
-    r'\s*\.\s*(Get|Post|Put|Delete|Patch|Head|Options)\s*\(\s*"([/*][^"]*)"\s*,'
+    r'\s*\.\s*(Get|Post|Put|Delete|Patch|Head|Options)\s*\(\s*' + _SLASH_LIT + r'\s*,'
 )
 
 # Receivers that are never routers: request accessors (`r.Header.Get`,
@@ -89,17 +99,25 @@ NON_ROUTER_RECEIVERS = frozenset(
 # Fiber: app.Get("/path", h)
 # Same shape as chi/echo title-case but framework is detected by app.* + fiber import.
 
-# Gorilla/mux: r.HandleFunc("/path", h).Methods("GET", "POST")
-GORILLA_HANDLEFUNC_PATTERN = re.compile(
-    r'\.HandleFunc\(\s*"([^"]+)"\s*,\s*\w+(?:\.\w+)*\s*\)(?P<chain>(?:\s*\.\s*\w+\([^)]*\))*)',
+# Gorilla/mux: a route is a chain from the router, read call by call:
+# r.HandleFunc("/path", h).Methods("GET", "POST"), r.Handle("/path", authMW(h)),
+# r.Path("/path").Methods("GET").HandlerFunc(h), r.PathPrefix("/static/").Handler(fs).
+# A chain that ends in `.Subrouter()` is a router, not a route (see route_auth).
+GORILLA_CHAIN_START = re.compile(
+    r"\b(\w+)\s*\.\s*(?:HandleFunc|Handle|Path|PathPrefix|Methods|Host|Schemes|Headers|Queries|Name|NewRoute)\s*\(",
 )
-GORILLA_METHODS_PATTERN = re.compile(
-    r'\.Methods\(\s*((?:"[A-Z]+"(?:\s*,\s*)?)+)\s*\)',
-)
+_GORILLA_PATH_CALLS = frozenset({"HandleFunc", "Handle", "Path", "PathPrefix"})
+_GORILLA_TERMINALS = {"HandleFunc": 1, "Handle": 1, "Handler": 0, "HandlerFunc": 0}  # -> handler arg
+_HTTP_METHOD_CONST = re.compile(r"\s*http\s*\.\s*Method([A-Z][a-z]+)\s*$")
 
-# net/http stdlib: http.HandleFunc("/path", h) or mux.HandleFunc("/path", h)
-NET_HTTP_HANDLEFUNC_PATTERN = re.compile(
-    r'\b(?:http|\w+)\.HandleFunc\(\s*"([^"]+)"\s*,',
+# net/http stdlib: http.HandleFunc("/path", h), mux.Handle("/path", h), and
+# Go 1.22 patterns `"[METHOD ][HOST]/[PATH]"`: mux.HandleFunc("GET /items/{id}", h).
+NET_HTTP_HANDLE_PATTERN = re.compile(
+    r'\b(\w+)\s*\.\s*(?:HandleFunc|Handle)\s*\(\s*' + _LIT + r'\s*,',
+)
+MUX_PATTERN_SYNTAX = re.compile(r"(?:([A-Z]+)[ \t]+)?([^/ \t]*)(/[^ \t]*)")
+MUX_PATTERN_HOST = re.compile(
+    r"(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|localhost|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?"
 )
 
 # External HTTP calls
@@ -201,6 +219,26 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     if len(line) > max_chars:
         line = line[: max_chars - 1] + "…"
     return line
+
+
+def _literal(match: re.Match, group: int) -> str:
+    """The path of a ``LIT`` alternation starting at ``group`` (the
+    interpreted-string group, then the raw-string one)."""
+    value = match.group(group)
+    return value if value is not None else match.group(group + 1)
+
+
+def _split_mux_pattern(pattern: str) -> tuple[str | None, str, str] | None:
+    """``(method, host, path)`` of a net/http ServeMux pattern
+    ``[METHOD ][HOST]/[PATH]`` (Go 1.22; older patterns are a path, or a host
+    and a path). None when it isn't one."""
+    match = MUX_PATTERN_SYNTAX.fullmatch(pattern)
+    if not match:
+        return None
+    method, host, path = match.groups()
+    if host and not MUX_PATTERN_HOST.fullmatch(host):
+        return None
+    return method, host, path
 
 
 def _module_name_from_gomod(gomod_path: Path, root: Path | None = None) -> str | None:
@@ -317,11 +355,32 @@ class GoAnalyzer:
         is_gorilla = _file_is_gorilla_mux(content)
         is_net_http = _file_is_net_http(content)
         routers: list[ra.FileRouters] = []  # built on first use
+        # Route keys include the file and each file is read once, so a fresh
+        # index per file is complete: key -> the route's index in result.routes.
+        seen: dict[tuple[str, str, str], int] = {}
 
-        def resolve(receiver: str, offset: int, path: str, local: list[ra.Guard]) -> ra.Resolution:
+        def file_routers() -> ra.FileRouters:
             if not routers:
                 routers.append(ra.FileRouters(content))
-            return routers[0].resolve_route(receiver, offset, path, local)
+            return routers[0]
+
+        def emit(
+            receiver: str, start: int, path: str, methods: list[str], local: list[ra.Guard] | None,
+            *, ordered: bool = True,
+        ) -> None:
+            """Record a route registered on ``receiver`` at ``start``, its path
+            joined with the prefixes of the groups it is registered in."""
+            resolution = file_routers().resolve_route(receiver, start, path, local, ordered=ordered)
+            full = resolution.path if resolution.path is not None else path
+            if not full:
+                return  # an empty path under a prefix we couldn't read
+            line = line_of(content, start)
+            for method in methods:
+                self._append_unique_route(
+                    result, full, method, relative, line,
+                    auth=resolution.auth, guards=resolution.guards, guard_evidence=resolution.evidence,
+                    seen=seen,
+                )
 
         def local_guards(start: int, paren: int, first: int, last: int | None) -> list[ra.Guard] | None:
             """Auth middleware among a registration's arguments [first:last];
@@ -333,40 +392,103 @@ class GoAnalyzer:
             args = ra.split_args(content, paren, close)[first:last]
             return [g for s, e in args if (g := ra.guard_from_arg(content, s, e, context))]
 
+        def handler_guards(start: int, paren: int, index: int) -> list[ra.Guard] | None:
+            """The handler argument ``index`` when it is wrapped in auth
+            middleware (``requireAuth(h)``)."""
+            close = ra.matching_close(content, paren)
+            if close < 0:
+                return None
+            args = ra.split_args(content, paren, close)
+            if not -len(args) <= index < len(args):
+                return []
+            s, e = args[index]
+            guard = ra.wrapper_guard(content, s, e, content[start : min(close + 1, start + 400)])
+            return [guard] if guard else []
+
+        def gorilla_route(match: re.Match) -> None:
+            """One gorilla route chain: its path (``HandleFunc``/``Handle``/``Path``/
+            ``PathPrefix``), ``.Methods(...)`` and handler argument."""
+            segments = ra.walk_chain(content, match.start(1) + len(match.group(1)))
+            path = ""
+            methods: list[str] = []
+            handler: tuple[int, int, int] | None = None  # (paren, close, arg index)
+            for name, open_idx, close in segments:
+                if name == "Subrouter":
+                    return  # a router (route_auth binds it), not a route
+                args = ra.split_args(content, open_idx, close)
+                if name in _GORILLA_PATH_CALLS:
+                    literal = ra.string_literal(content[args[0][0] : args[0][1]]) if args else None
+                    if literal is None:
+                        return  # a path we can't read
+                    if name in ("HandleFunc", "Handle") and (" " in literal or "\t" in literal):
+                        pattern = _split_mux_pattern(literal)  # net/http's Go 1.22 syntax
+                        if pattern is None:
+                            return
+                        if pattern[0]:
+                            methods.append(pattern[0])
+                        literal = pattern[2]
+                    path = ra.join_paths(path, literal)
+                elif name == "Methods":
+                    for s, e in args:
+                        text = content[s:e]
+                        value = ra.string_literal(text)
+                        const = _HTTP_METHOD_CONST.match(text)
+                        if value is not None:
+                            methods += [m.strip().upper() for m in value.split(",") if m.strip()]
+                        elif const:
+                            methods.append(const.group(1).upper())
+                if name in _GORILLA_TERMINALS and handler is None:
+                    handler = (open_idx, close, _GORILLA_TERMINALS[name])
+            if handler is None or not path:
+                return
+            open_idx, close, index = handler
+            args = ra.split_args(content, open_idx, close)
+            if index < len(args) and file_routers().is_router(content[args[index][0] : args[index][1]], match.start()):
+                return  # http.Handle("/", r): serves the router itself
+            local: list[ra.Guard] = []
+            if index < len(args):
+                s, e = args[index]
+                context = content[match.start() : min(close + 1, match.start() + 400)]
+                guard = ra.wrapper_guard(content, s, e, context)
+                local = [guard] if guard else []
+            emit(match.group(1), match.start(), path, list(dict.fromkeys(methods)) or ["ANY"], local, ordered=False)
+
         # Gin / echo: uppercase verb method (r.GET, e.POST, ...). Echo's runtime API
         # is the same uppercase shape as gin's despite different surface labels.
         # Route middleware: gin `r.POST(path, mw..., h)`, echo `e.POST(path, h, mw...)`.
         if is_gin or is_echo:
             echo_args = is_echo and not is_gin
             for match in GIN_ROUTE_PATTERN.finditer(content):
-                method, path = match.group(2).upper(), match.group(3)
-                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-                if index is None:
-                    continue
-                paren = content.find("(", match.start())
+                paren = match.end(2)
                 local = local_guards(match.start(), paren, 2, None) if echo_args else local_guards(match.start(), paren, 1, -1)
-                if local is not None:
-                    self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
+                emit(match.group(1), match.start(), _literal(match, 3), [match.group(2)], local)
 
         # Chi / fiber: title-case verb method (r.Get, app.Post, ...). Only run when
         # we know which framework is in this file; otherwise we'd mis-attribute
         # generic `.Get(...)` calls on non-router types.
-        # Route middleware: fiber `app.Post(path, mw..., h)`; chi uses `.With(mw)`.
+        # Route middleware: fiber `app.Post(path, mw..., h)`; chi uses `.With(mw)`
+        # or wraps the handler (`r.Post("/x", requireAuth(h))`).
         if is_chi or is_fiber:
             for match in CHI_ECHO_ROUTE_PATTERN.finditer(content):
                 if match.group(1) in NON_ROUTER_RECEIVERS:
                     continue
-                method, path = match.group(2).upper(), match.group(3)
-                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-                if index is None:
-                    continue
-                paren = content.find("(", match.start())
-                local = local_guards(match.start(), paren, 1, -1) if is_fiber and not is_chi else []
-                if local is not None:
-                    self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
+                paren = match.end(2)
+                if is_fiber and not is_chi:
+                    local = local_guards(match.start(), paren, 1, -1)
+                else:
+                    local = handler_guards(match.start(), paren, -1)
+                emit(match.group(1), match.start(), _literal(match, 3), [match.group(2).upper()], local)
 
-        # Chi inline middleware: r.With(mw...)[.With(mw...)].Post("/path", h).
         if is_chi:
+            # r.Method("GET", "/path", h)
+            for match in CHI_METHOD_PATTERN.finditer(content):
+                if match.group(1) in NON_ROUTER_RECEIVERS:
+                    continue
+                paren = content.find("(", match.start(1) + len(match.group(1)))
+                local = handler_guards(match.start(), paren, -1)
+                emit(match.group(1), match.start(), _literal(match, 3), [match.group(2)], local)
+
+            # Chi inline middleware: r.With(mw...)[.With(mw...)].Post("/path", h).
             for match in CHI_WITH_PATTERN.finditer(content):
                 if match.group(1) in NON_ROUTER_RECEIVERS:
                     continue
@@ -384,35 +506,37 @@ class GoAnalyzer:
                         continue
                     verb = CHI_WITH_VERB_PATTERN.match(content, close + 1)
                     if verb:
-                        method, path = verb.group(1).upper(), verb.group(2)
-                        line = line_of(content, match.start())
-                        index = self._append_unique_route(result, path, method, relative, line)
-                        if index is not None:
-                            self._set_route_auth(result, index, resolve(match.group(1), match.start(), path, local))
+                        emit(match.group(1), match.start(), _literal(verb, 2), [verb.group(1).upper()], local)
                     break
 
-        # Gorilla/mux: HandleFunc + chained .Methods("GET", "POST")
+        # Gorilla/mux: a chain of route-builder calls ending in a handler.
+        # Middleware is `r.Use(...)` on the router or a subrouter, which gorilla
+        # applies to all of its routes whenever they were registered.
         if is_gorilla:
-            for match in GORILLA_HANDLEFUNC_PATTERN.finditer(content):
-                path = match.group(1)
-                line = line_of(content, match.start())
-                chain = match.group("chain") or ""
-                methods_match = GORILLA_METHODS_PATTERN.search(chain)
-                if methods_match:
-                    methods = re.findall(r'"([A-Z]+)"', methods_match.group(1))
-                    if methods:
-                        for method in methods:
-                            self._append_unique_route(result, path, method, relative, line)
-                        continue
-                self._append_unique_route(result, path, "ANY", relative, line)
+            for match in GORILLA_CHAIN_START.finditer(content):
+                gorilla_route(match)
 
-        # net/http stdlib: http.HandleFunc / mux.HandleFunc — always emit, but only
-        # when the file isn't already covered by gorilla/mux (which uses HandleFunc too
-        # but wraps it with .Methods()).
+        # net/http stdlib: http.HandleFunc / mux.Handle, Go 1.22 method and host
+        # patterns — but only when the file isn't already covered by gorilla/mux
+        # (whose chain extractor reads the same calls).
         if is_net_http and not is_gorilla:
-            for match in NET_HTTP_HANDLEFUNC_PATTERN.finditer(content):
-                path = match.group(1)
-                self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
+            for match in NET_HTTP_HANDLE_PATTERN.finditer(content):
+                pattern = _split_mux_pattern(_literal(match, 2))
+                if pattern is None:
+                    continue
+                method, host, path = pattern
+                paren = content.find("(", match.start(1) + len(match.group(1)))
+                close = ra.matching_close(content, paren)
+                args = ra.split_args(content, paren, close) if close >= 0 else []
+                if len(args) >= 2 and file_routers().is_router(content[args[1][0] : args[1][1]], match.start()):
+                    continue  # http.Handle("/", r): serves a router, whose routes are extracted
+                local = handler_guards(match.start(), paren, 1)
+                emit(match.group(1), match.start(), path, [method or "ANY"], local)
+                if host:
+                    self._append_unique_service(
+                        result, f"route_host:{host}", relative,
+                        line=line_of(content, match.start()), evidence=_line_snippet(content, match.start()),
+                    )
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -507,11 +631,26 @@ class GoAnalyzer:
         auth: str = ra.UNKNOWN,
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
+        seen: dict[tuple[str, str, str], int] | None = None,
     ) -> int | None:
         """Append a route once per (path, method, file); return its index, or
-        None when it was already recorded."""
+        None when it was already recorded. ``seen`` maps the keys recorded so
+        far (the caller's, for one file) to their index, so a file with many
+        routes stays linear; without it the result's routes are scanned.
+
+        A key registered again with a different auth becomes ``unknown``:
+        which registration serves the request depends on the framework (echo
+        replaces the handler, chi prefers a static route over a mount), so
+        neither guard can be trusted."""
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if seen is not None:
+            index = seen.get(key)
+        else:
+            index = next((i for i, r in enumerate(result.routes) if (r.path, r.method, r.file) == key), None)
+        if index is not None:
+            existing = result.routes[index]
+            if (existing.auth, existing.guards) != (auth, list(guards or [])) and existing.auth != ra.UNKNOWN:
+                result.routes[index] = Route(path=existing.path, method=existing.method, file=existing.file, line=existing.line)
             return None
         result.routes.append(
             Route(
@@ -519,19 +658,9 @@ class GoAnalyzer:
                 auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
             )
         )
+        if seen is not None:
+            seen[key] = len(result.routes) - 1
         return len(result.routes) - 1
-
-    @staticmethod
-    def _set_route_auth(result: ScanResult, index: int, resolution: ra.Resolution) -> None:
-        """Declare a route's auth (AttackMap#256); older cores ignore the fields.
-        Rebuilt rather than mutated so Route's guard_evidence redaction runs."""
-        if resolution.auth == ra.UNKNOWN:
-            return
-        route = result.routes[index]
-        result.routes[index] = Route(
-            path=route.path, method=route.method, file=route.file, line=route.line,
-            auth=resolution.auth, guards=list(resolution.guards), guard_evidence=resolution.evidence,
-        )
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
@@ -576,11 +705,13 @@ class GoAnalyzer:
         result.entrypoint_hints.append(EntrypointHint(hint=hint, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
-    def _append_unique_service(result: ScanResult, hint: str, file: str) -> None:
+    def _append_unique_service(
+        result: ScanResult, hint: str, file: str, *, line: int | None = None, evidence: str | None = None
+    ) -> None:
         key = (hint, file)
         if any((item.hint, item.file) == key for item in result.service_hints):
             return
-        result.service_hints.append(ServiceHint(hint=hint, file=file))
+        result.service_hints.append(ServiceHint(hint=hint, file=file, line=line, evidence_text=evidence))
 
 
 __all__ = ["GoAnalyzer"]
