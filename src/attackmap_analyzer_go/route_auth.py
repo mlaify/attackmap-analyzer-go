@@ -289,15 +289,28 @@ def guard_from_arg(content: str, start: int, end: int, context: str | None = Non
 
 
 # A handler wrapped in middleware: `requireAuth(h)`, `authMW(h)`,
-# `jwtMiddleware.Handler(h)`, `auth.Middleware(h)`. Only a call whose name is
-# also middleware-shaped counts, so `auth.LoginHandler(db)` (a handler
-# constructor in an auth package) isn't mistaken for a guard.
+# `auth.Middleware(h)`, `jwtMiddleware.Handler(h)`. The called name (the last
+# dotted segment) must be middleware-shaped, or be `Handler` / `Wrap` on a
+# middleware-named receiver, so a handler constructor such as
+# `auth.LoginHandler(db)`, `authMW.LoginHandler(db)` or
+# `oauthMiddleware.Callback(cb)` isn't mistaken for a guard.
 _WRAPPER_SEGMENT = re.compile(
     r"(?:\w*(?:middleware|mw|required|guard|protect(?:ed)?|wrap(?:per)?)"
     r"|(?:require|ensure|must|with|verify|check|authenticated?|protect)\w*)$",
     re.IGNORECASE,
 )
+_WRAPPER_METHOD = re.compile(r"(?:Handler|HandlerFunc|Wrap|WrapHandler)$")
+_MIDDLEWARE_RECEIVER = re.compile(r"\w*(?:middleware|mw)$", re.IGNORECASE)
 _CALL_NAME = re.compile(r"\s*([A-Za-z_][\w.]*)\s*\(")
+
+
+def _wrapper_shaped(name: str) -> bool:
+    segments = name.split(".")
+    if _WRAPPER_SEGMENT.match(segments[-1]):
+        return True
+    return len(segments) > 1 and bool(_WRAPPER_METHOD.match(segments[-1])) and bool(
+        _MIDDLEWARE_RECEIVER.match(segments[-2])
+    )
 
 
 def wrapper_guard(content: str, start: int, end: int, context: str) -> Guard | None:
@@ -309,7 +322,7 @@ def wrapper_guard(content: str, start: int, end: int, context: str) -> Guard | N
     close = matching_close(content, match.end() - 1)
     if close < 0 or close >= end or not content[match.end() : close].strip():
         return None
-    if not any(_WRAPPER_SEGMENT.match(seg) for seg in match.group(1).split(".")):
+    if not _wrapper_shaped(match.group(1)):
         return None
     return guard_from_arg(content, start, end, context)
 
@@ -334,6 +347,8 @@ class Binding:
     # The latest earlier binding of the same name in an outer block that
     # contains this one's offset: where a lookup goes once this scope closed.
     enclosing: "Binding | None" = None
+    # Mounted under more than one parent: its auth can't be resolved.
+    ambiguous: bool = False
 
     def __post_init__(self) -> None:
         if self.link < 0:
@@ -374,6 +389,10 @@ _FUNC_DEF = re.compile(
     re.MULTILINE,
 )
 _USE = re.compile(r"\b(\w+)\s*\.\s*Use\s*\(")
+# chi `r.With(mw...).Route("/x", func(r chi.Router) {...})` / `.Group(func(r chi.Router) {...})`:
+# a closure router carrying the inline middleware. The chain is walked from `.With(`.
+_WITH = re.compile(r"\b(\w+)\s*\.\s*With\s*\(")
+_FUNC_PARAM = re.compile(r"\s*func\s*\(\s*(\w+)\s+[\w.*]+\s*\)\s*\{")
 
 
 @dataclass
@@ -402,14 +421,15 @@ class FileRouters:
         self._by_name: dict[str, list[Binding]] = {}
         self._offsets: dict[str, list[int]] = {}
         self._free: dict[tuple[str, int], Binding] = {}
-        self._roots: list[Binding] = []
+        self._roots: list[Binding] = []  # in offset order
+        self._root_offsets: list[int] = []
         self._funcs: dict[str, list[re.Match]] | None = None
         mounts: list[re.Match] = []
         # Sweep state: blocks open at the current event offset.
         self._stack: list[tuple[int, int]] = []
         self._next_block = 0
         events: list[tuple[int, int, re.Match]] = []
-        for kind, pattern in enumerate((_ROOT, _DERIVED, _SUBROUTER, _CLOSURE, _USE, _MOUNT)):
+        for kind, pattern in enumerate((_ROOT, _DERIVED, _SUBROUTER, _CLOSURE, _USE, _MOUNT, _WITH)):
             events += [(m.start(), kind, m) for m in pattern.finditer(content)]
         events.sort(key=lambda e: (e[0], e[1]))
         for offset, kind, match in events:
@@ -417,6 +437,7 @@ class FileRouters:
             if kind == 0:
                 binding = Binding(match.group(1), offset, scope, root=True)
                 self._roots.append(binding)
+                self._root_offsets.append(offset)
                 self._bind(binding)
             elif kind == 1:
                 self._derive(match, scope)
@@ -426,8 +447,10 @@ class FileRouters:
                 self._closure(match)
             elif kind == 4:
                 self._use(match)
-            else:
+            elif kind == 5:
                 mounts.append(match)
+            else:
+                self._with_closure(match)
         # Mounted routers are often built after the call, in a later function.
         for match in mounts:
             self._mount(match)
@@ -553,6 +576,37 @@ class FileRouters:
         name = match.group(5) or match.group(1)
         self._bind(Binding(name, body_open, (body_open, body_close), parent, literal or ""))
 
+    def _with_closure(self, match: re.Match) -> None:
+        segments = walk_chain(self.content, match.start(1) + len(match.group(1)))
+        if len(segments) < 2 or segments[-1][0] not in ("Route", "Group"):
+            return
+        if any(name != "With" for name, _, _ in segments[:-1]):
+            return
+        parent = self.resolve(match.group(1), match.start())
+        if parent is None:
+            return
+        guards: list[Guard] = []
+        for _, open_idx, close in segments[:-1]:
+            context = self._context(match.start(), close)
+            args = split_args(self.content, open_idx, close)
+            guards += [g for s, e in args if (g := guard_from_arg(self.content, s, e, context))]
+        name, open_idx, close = segments[-1]
+        args = split_args(self.content, open_idx, close)
+        prefix: str | None = ""
+        if name == "Route":
+            if len(args) != 2:
+                return
+            prefix = string_literal(self.content[args[0][0] : args[0][1]])
+        elif len(args) != 1:
+            return
+        func = _FUNC_PARAM.match(self.content, args[-1][0], args[-1][1])
+        if not func:
+            return
+        body_open = func.end() - 1
+        body_close = matching_close(self.content, body_open)
+        if body_close >= 0:
+            self._bind(Binding(func.group(1), body_open, (body_open, body_close), parent, prefix, guards))
+
     def _use(self, match: re.Match) -> None:
         binding = self.resolve(match.group(1), match.start())
         call = self._call(match.end() - 1)
@@ -606,10 +660,10 @@ class FileRouters:
             if found is None:
                 return
             body = found[1]
-            roots = [b for b in self._roots if body[0] < b.offset < body[1]]
-            if len(roots) != 1:
+            first = bisect.bisect_right(self._root_offsets, body[0])
+            if bisect.bisect_left(self._root_offsets, body[1]) - first != 1:
                 return
-            target = roots[0]
+            target = self._roots[first]
         elif kind == "Route" and call is None:
             # r.Route("/admin", adminRoutes): the function's router parameter.
             found = self._function(second or first, second is not None)
@@ -630,9 +684,9 @@ class FileRouters:
             node = node.parent
         literal = match.group(3) if match.group(3) is not None else match.group(4)
         if target.parent is not None:
-            # Mounted twice: the prefix is ambiguous.
-            if target.prefix != literal:
-                target.prefix = None
+            # Mounted twice: reachable under either parent, so neither its
+            # prefix nor the parents' middleware is known.
+            target.prefix, target.ambiguous = None, True
             return
         target.parent, target.prefix, target.link = parent, literal, match.start()
 
@@ -664,7 +718,7 @@ class FileRouters:
         position = offset
         top = binding
         for _ in range(_MAX_DEPTH):
-            if binding.overflow:
+            if binding.overflow or binding.ambiguous:
                 auth_known = False
             for use_offset, guards in binding.uses if auth_known else ():
                 if ordered and use_offset >= position:
@@ -686,7 +740,10 @@ class FileRouters:
                 break
             binding = binding.parent
         else:
-            return Resolution(path=known)  # derivation deeper than _MAX_DEPTH
+            # Derivation deeper than _MAX_DEPTH: the prefix is unknown. The
+            # route's own path, not a partial join that two routes at
+            # different depths could share.
+            return Resolution(path=path)
         if not auth_known:
             return Resolution(path=known)
         resolution = evaluate(applied, rel_path if top.root else None)

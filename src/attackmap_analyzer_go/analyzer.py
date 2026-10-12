@@ -355,6 +355,8 @@ class GoAnalyzer:
         is_gorilla = _file_is_gorilla_mux(content)
         is_net_http = _file_is_net_http(content)
         routers: list[ra.FileRouters] = []  # built on first use
+        # Route keys include the file, so this file's keys are all that can collide.
+        seen = {(r.path, r.method, r.file) for r in result.routes if r.file == relative}
 
         def file_routers() -> ra.FileRouters:
             if not routers:
@@ -376,6 +378,7 @@ class GoAnalyzer:
                 self._append_unique_route(
                     result, full, method, relative, line,
                     auth=resolution.auth, guards=resolution.guards, guard_evidence=resolution.evidence,
+                    seen=seen,
                 )
 
         def local_guards(start: int, paren: int, first: int, last: int | None) -> list[ra.Guard] | None:
@@ -627,11 +630,18 @@ class GoAnalyzer:
         auth: str = ra.UNKNOWN,
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
+        seen: set[tuple[str, str, str]] | None = None,
     ) -> int | None:
         """Append a route once per (path, method, file); return its index, or
-        None when it was already recorded."""
+        None when it was already recorded. ``seen`` holds the keys recorded so
+        far (the caller's, for one file), so a file with many routes stays
+        linear; without it the result's routes are scanned."""
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if seen is not None:
+            if key in seen:
+                return None
+            seen.add(key)
+        elif any((item.path, item.method, item.file) == key for item in result.routes):
             return None
         result.routes.append(
             Route(

@@ -1205,7 +1205,130 @@ def test_route_scopes_stay_linear_on_adversarial_nesting() -> None:
         start = time.monotonic()
         GoAnalyzer()._extract_routes(source, "f.go", result)
         assert time.monotonic() - start < 10
-    # Derivation deeper than the walk limit keeps the path we could join.
+    # Derivation deeper than the walk limit leaves the prefix unknown: the
+    # route keeps its own path, not a partial join of the last 32 prefixes.
     result = ScanResult(root=".")
     GoAnalyzer()._extract_routes(nested, "f.go", result)
-    assert len(result.routes) == 1 and result.routes[0].path.endswith("/a/x")
+    assert [r.path for r in result.routes] == ["/x"]
+    deep = _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + '\tr.Route("/a", func(r chi.Router) {\n' * 40 + '\tr.Get("/x", h)\n' + "\t})\n" * 40 + "}\n"
+    result = ScanResult(root=".")
+    GoAnalyzer()._extract_routes(deep, "f.go", result)
+    assert [r.path for r in result.routes] == ["/x"]
+    shallow = _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + '\tr.Route("/a", func(r chi.Router) {\n' * 5 + '\tr.Get("/y", h)\n' + "\t})\n" * 5 + "}\n"
+    result = ScanResult(root=".")
+    GoAnalyzer()._extract_routes(shallow, "f.go", result)
+    assert [r.path for r in result.routes] == ["/a/a/a/a/a/y"]
+
+
+def test_router_mounted_twice_has_unknown_auth_and_its_own_path(tmp_path: Path) -> None:
+    """Reachable under the public mount too: the admin mount's guard doesn't apply."""
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes() http.Handler {\n"
+        "\tadmin := chi.NewRouter()\n"
+        "\tadmin.Use(AuthRequired)\n"
+        "\tpublic := chi.NewRouter()\n"
+        "\tsub := chi.NewRouter()\n"
+        '\tsub.Post("/items", createItem)\n'
+        '\tadmin.Mount("/x", sub)\n'
+        '\tpublic.Mount("/x", sub)\n'
+        "\tonce := chi.NewRouter()\n"
+        '\tonce.Post("/things", createThing)\n'
+        '\tadmin.Mount("/y", once)\n'
+        "\treturn admin\n"
+        "}\n",
+    )
+    assert routes["POST /items"].auth == "unknown"
+    assert routes["POST /items"].guards == []
+    assert routes["POST /y/things"].auth == "required"
+
+
+def test_chi_with_route_and_group_closures_keep_prefix_and_auth(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes() http.Handler {\n"
+        "\tr := chi.NewRouter()\n"
+        '\tr.With(jwtauth.Authenticator(ta)).Route("/admin", func(r chi.Router) {\n'
+        '\t\tr.Post("/reset", reset)\n'
+        "\t})\n"
+        "\tr.With(logger).With(AuthRequired).Group(func(g chi.Router) {\n"
+        '\t\tg.Delete("/items/{id}", deleteItem)\n'
+        "\t})\n"
+        '\tr.With(logger).Route("/public", func(r chi.Router) {\n'
+        '\t\tr.Post("/feedback", feedback)\n'
+        "\t})\n"
+        "\treturn r\n"
+        "}\n",
+    )
+    assert set(routes) == {"POST /admin/reset", "DELETE /items/{id}", "POST /public/feedback"}
+    assert routes["POST /admin/reset"].guards == ["jwtauth.Authenticator"]
+    assert routes["DELETE /items/{id}"].auth == "required"
+    assert routes["POST /public/feedback"].auth == "unknown"
+
+
+def test_wrapper_guard_needs_a_middleware_shaped_call(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        "main.go",
+        'package main\n\nimport "net/http"\n\n'
+        "func main() {\n"
+        "\tmux := http.NewServeMux()\n"
+        '\tmux.Handle("POST /login", authMW.LoginHandler(db))\n'
+        '\tmux.Handle("GET /oauth/callback", oauthMiddleware.Callback(cb))\n'
+        '\tmux.Handle("POST /token", auth.TokenHandler(store))\n'
+        '\tmux.Handle("POST /a", jwtMiddleware.Handler(h))\n'
+        '\tmux.Handle("POST /b", auth.Middleware(h))\n'
+        '\tmux.Handle("POST /c", authMW(h))\n'
+        "}\n",
+    )
+    for key in ("POST /login", "GET /oauth/callback", "POST /token"):
+        assert routes[key].auth == "unknown", key
+    for key in ("POST /a", "POST /b", "POST /c"):
+        assert routes[key].auth == "required", key
+
+
+def test_large_files_stay_linear(tmp_path: Path) -> None:
+    """Many mounts of builder functions, and many routes in one file."""
+    import time
+
+    from attackmap_analyzer_go.contracts import ScanResult
+
+    mounts = (
+        _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n"
+        + "".join(f'\tr.Mount("/m{i}", build{i}())\n' for i in range(20000))
+        + "}\n"
+        + "".join(f"func build{i}() http.Handler {{\n\tr := chi.NewRouter()\n\tr.Get(\"/x\", h)\n\treturn r\n}}\n" for i in range(20000))
+    )
+    routes = _CHI_HEADER + "func R() {\n\tr := chi.NewRouter()\n" + "".join(f'\tr.Get("/r{i}", h)\n' for i in range(16000)) + "}\n"
+    for source, expected in ((mounts, 20000), (routes, 16000)):
+        result = ScanResult(root=".")
+        start = time.monotonic()
+        GoAnalyzer()._extract_routes(source, "f.go", result)
+        assert time.monotonic() - start < 3
+        assert len(result.routes) == expected
+
+
+def test_guarded_group_route_has_no_unguarded_twin_end_to_end(tmp_path: Path) -> None:
+    """With core's built-in Go extractor merged in, a guarded group route must
+    not also appear as an unprefixed, unguarded twin (mlaify/AttackMap#337)."""
+    merge = pytest.importorskip("attackmap.merge")
+    if not hasattr(merge, "superseded_builtin_routes"):
+        pytest.skip("installed AttackMap core predates the route-twin fix (mlaify/AttackMap#337)")
+    from attackmap.analyzer import identify_attack_surfaces
+    from attackmap.analyzers import DefaultAnalyzer, analyze_repository
+    from attackmap.route_auth_fusion import unauthenticated_routes
+
+    (tmp_path / "main.go").write_text(
+        'package main\n\nimport "github.com/gin-gonic/gin"\n\n'
+        "func main() {\n"
+        "\tr := gin.Default()\n"
+        '\tapi := r.Group("/api", AuthRequired())\n'
+        '\tapi.POST("/users", createUser)\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    scan = analyze_repository(tmp_path, analyzers=[DefaultAnalyzer(), GoAnalyzer()])
+    assert [(r.method, r.path, r.auth) for r in scan.routes] == [("POST", "/api/users", "required")]
+    assert unauthenticated_routes(scan, identify_attack_surfaces(scan)) == []
