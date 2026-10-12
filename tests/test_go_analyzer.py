@@ -1441,3 +1441,99 @@ def test_router_served_directly_and_mounted_has_unknown_auth(tmp_path: Path) -> 
         )
         assert routes["POST /items"].auth == "unknown", serve
         assert routes["POST /y/things"].auth == "required", serve
+
+
+def _mounted_sub(tmp_path: Path, extra: str) -> dict:
+    for name in tmp_path.iterdir():
+        name.unlink()
+    return _routes(
+        tmp_path,
+        "routes.go",
+        _CHI_HEADER + "func Routes(prefix string, ln net.Listener, srv *http.Server) {\n"
+        "\tadmin := chi.NewRouter()\n"
+        "\tadmin.Use(AuthRequired)\n"
+        "\tsub := chi.NewRouter()\n"
+        "\tsub.Use(middleware.Logger)\n"
+        '\tsub.With(limit).Post("/items", createItem)\n'
+        '\tadmin.Mount("/x", sub)\n'
+        f"\t{extra}\n"
+        "}\n",
+    )
+
+
+def test_mounted_router_used_any_other_way_has_unknown_auth(tmp_path: Path) -> None:
+    """Served directly, wrapped, assigned or passed on: reachable without the parent's guard."""
+    for use in (
+        'http.ListenAndServe(fmt.Sprintf(":%d", port), sub)',
+        "http.Serve(ln, sub)",
+        "srv.Handler = sub",
+        "h := handlers.LoggingHandler(os.Stdout, sub)",
+        "mux.Handle(prefix, sub)",
+        'mux.HandleFunc("/", sub.ServeHTTP)',
+        "serve(sub)",
+        "other := sub",
+        'mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) { sub.ServeHTTP(w, req) })',
+    ):
+        routes = _mounted_sub(tmp_path, use)
+        assert routes["POST /items"].auth == "unknown", use
+        assert routes["POST /items"].guards == [], use
+
+
+def test_mounted_router_with_only_its_own_calls_keeps_the_parent_guard(tmp_path: Path) -> None:
+    for use in (
+        'log.Println("sub mounted")',
+        "// sub is served under /x",
+        "cfg.sub = nil",
+        'sub.Get("/health", health)',
+        "",
+    ):
+        routes = _mounted_sub(tmp_path, use)
+        assert routes["POST /x/items"].auth == "required", use
+
+
+def test_builder_function_used_again_has_unknown_auth(tmp_path: Path) -> None:
+    def source(extra: str) -> str:
+        return (
+            _CHI_HEADER + "func Routes(h *Handler) {\n"
+            "\tr := chi.NewRouter()\n"
+            "\tr.Use(AuthRequired)\n"
+            '\tr.Mount("/api", apiRouter())\n'
+            '\tr.Mount("/things", h.Routes())\n'
+            f"\t{extra}\n"
+            "}\n\n"
+            "func apiRouter() http.Handler {\n\tr := chi.NewRouter()\n\tr.Post(\"/items\", h)\n\treturn r\n}\n\n"
+            "func (h *Handler) Routes() chi.Router {\n\tr := chi.NewRouter()\n\tr.Post(\"/\", h.create)\n\treturn r\n}\n"
+        )
+
+    for extra, unknown in (
+        ("", set()),
+        ('http.ListenAndServe(":8080", apiRouter())', {"POST /items"}),
+        ("go serve(h.Routes())", {"POST /"}),
+        ("var Routes = 1", set()),  # a bare name isn't the method `h.Routes`
+    ):
+        for name in tmp_path.iterdir():
+            name.unlink()
+        routes = _routes(tmp_path, "routes.go", source(extra))
+        auth = {key: r.auth for key, r in routes.items()}
+        expected = {
+            ("POST /items" if "POST /items" in unknown else "POST /api/items"): "unknown" if "POST /items" in unknown else "required",
+            ("POST /" if "POST /" in unknown else "POST /things/"): "unknown" if "POST /" in unknown else "required",
+        }
+        assert auth == expected, extra
+
+
+
+def test_router_tracking_stays_linear_with_many_mounted_routers() -> None:
+    """Every builder names its router `r`: checking how each mounted `r` is used
+    only looks at the scopes around an occurrence. 8x the mounts must cost
+    under 14x (linear ~7x; scanning every `r` per occurrence ~21x)."""
+    from attackmap_analyzer_go import route_auth as ra
+
+    def seconds(n: int) -> float:
+        source = _mounts(n)
+        ra.bracket_pairs(source)  # cached per file; built once outside the timing
+        ra.literal_spans(source)
+        return _best_seconds(lambda: ra.FileRouters(source))
+
+    ratio = seconds(8000) / seconds(1000)
+    assert ratio < 14, ratio

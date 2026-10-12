@@ -113,6 +113,42 @@ def bracket_pairs(content: str) -> dict[int, int]:
     return pairs
 
 
+@functools.lru_cache(maxsize=4)
+def literal_spans(content: str) -> tuple[list[int], list[int]]:
+    """Starts and ends of Go strings, raw strings, runes and comments, in one
+    forward pass (the same tokens `bracket_pairs` skips)."""
+    starts: list[int] = []
+    ends: list[int] = []
+    pos = 0
+    n = len(content)
+    while pos < n:
+        match = _SCAN_TOKEN.search(content, pos)
+        if not match:
+            break
+        token = match.group()
+        pos = match.end()
+        if token in _STRING_BODY:
+            body = _STRING_BODY[token].match(content, pos)
+            pos = body.end() if body else pos
+        elif token == "//":
+            nl = content.find("\n", pos)
+            pos = n if nl < 0 else nl
+        elif token == "/*":
+            end = content.find("*/", pos)
+            pos = n if end < 0 else end + 2
+        else:
+            continue
+        starts.append(match.start())
+        ends.append(pos)
+    return starts, ends
+
+
+def in_literal(content: str, offset: int) -> bool:
+    starts, ends = literal_spans(content)
+    index = bisect.bisect_right(starts, offset) - 1
+    return index >= 0 and offset < ends[index]
+
+
 def matching_close(content: str, open_idx: int) -> int:
     if open_idx < 0:
         return -1
@@ -389,15 +425,19 @@ _FUNC_DEF = re.compile(
     re.MULTILINE,
 )
 _USE = re.compile(r"\b(\w+)\s*\.\s*Use\s*\(")
-# A router served on its own: `http.ListenAndServe(addr, api)` (or TLS),
-# `http.Server{Handler: api}`, `mux.Handle("/", api)` /
-# `mux.Handle("/api/", http.StripPrefix("/api", api))`. One that is also
-# mounted is reachable under two parents.
-_SERVED = re.compile(
-    r"\bhttp\s*\.\s*ListenAndServe(?:TLS)?\s*\((?:[^(),]{0,300},\s*){1,3}(\w+)\s*\)"
-    r"|\bHandler\s*:\s*(\w+)\s*[,}\n]"
-    r"|\b\w+\s*\.\s*Handle\s*\(\s*" + LIT + r"\s*,\s*(?:http\s*\.\s*StripPrefix\s*\(\s*" + LIT + r"\s*,\s*)?(\w+)\s*\)"
-)
+# Identifiers, for checking how a mounted router (or the function that builds
+# it) is used elsewhere in the file; a method call on it (`sub.Get(`) is fine.
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+_METHOD_CALL = re.compile(r"\s*\.\s*(\w+)\s*\(")
+_RETURN_BEFORE = re.compile(r"\breturn\s+$")
+_SELECTOR_BEFORE = re.compile(r"\.\s*$")
+# Identifier occurrences checked per file before giving up; mounted routers
+# not yet cleared are then treated as ambiguous.
+_MAX_MOUNT_USES = 20000
+# Mounted-router scopes checked around one occurrence (sibling scopes before
+# it have closed; this bounds nested ones).
+_MAX_NESTED_SCOPES = 8
+
 # chi `r.With(mw...).Route("/x", func(r chi.Router) {...})` / `.Group(func(r chi.Router) {...})`:
 # a closure router carrying the inline middleware. The chain is walked from `.With(`.
 _WITH = re.compile(r"\b(\w+)\s*\.\s*With\s*\(")
@@ -430,6 +470,10 @@ class FileRouters:
         self._by_name: dict[str, list[Binding]] = {}
         self._offsets: dict[str, list[int]] = {}
         self._free: dict[tuple[str, int], Binding] = {}
+        # Mounted routers to check for other uses: (target, the mount's
+        # argument span, variable name or None, builder function name or None,
+        # the function name's offset in its declaration).
+        self._mounted: list[tuple[Binding, tuple[int, int], str | None, str | None, int, bool]] = []
         self._roots: list[Binding] = []  # in offset order
         self._root_offsets: list[int] = []
         self._funcs: dict[tuple[str, bool], list[re.Match]] | None = None
@@ -463,8 +507,7 @@ class FileRouters:
         # Mounted routers are often built after the call, in a later function.
         for match in mounts:
             self._mount(match)
-        for match in _SERVED.finditer(content):
-            self._served(match)
+        self._check_mounted_uses()
 
     # -- scopes --
 
@@ -661,11 +704,16 @@ class FileRouters:
         if first == "func":
             return
         target: Binding | None = None
+        variable: str | None = None
+        function: str | None = None
+        function_offset = -1
+        method = False
         if kind == "Mount" and call is None and second is None:
             # r.Mount("/admin", sub): a router built in this file.
             target = self.resolve(first, match.start())
             if target is None or not target.root:
                 return
+            variable = first
         elif kind == "Mount" and call is not None:
             # r.Mount("/admin", adminRouter()): the one router that function builds.
             found = self._function(second or first, second is not None)
@@ -676,12 +724,16 @@ class FileRouters:
             if bisect.bisect_left(self._root_offsets, body[1]) - first != 1:
                 return
             target = self._roots[first]
+            variable, function, function_offset = target.name, found[0].group(2), found[0].start(2)
+            method = second is not None
         elif kind == "Route" and call is None:
             # r.Route("/admin", adminRoutes): the function's router parameter.
             found = self._function(second or first, second is not None)
             if found is None or found[0].group(3) is None:
                 return
             target = self._free_binding(found[0].group(3), found[1])
+            function, function_offset = found[0].group(2), found[0].start(2)
+            method = second is not None
         if target is None:
             return
         parent = self.resolve(match.group(1), match.start())
@@ -701,14 +753,76 @@ class FileRouters:
             target.prefix, target.ambiguous = None, True
             return
         target.parent, target.prefix, target.link = parent, literal, match.start()
+        paren = self.content.find("(", match.end(2))
+        close = matching_close(self.content, paren)
+        args = split_args(self.content, paren, close) if close >= 0 else []
+        span = args[1] if len(args) >= 2 else (match.start(), match.end())
+        self._mounted.append((target, span, variable, function, function_offset, method))
 
-    def _served(self, match: re.Match) -> None:
-        name = match.group(1) or match.group(2) or match.group(7)
-        target = self.resolve(name, match.start())
-        if target is not None and target.parent is not None:
-            # Mounted, and also served at the root: neither parent's prefix
-            # nor middleware is known to apply.
-            target.prefix, target.ambiguous = None, True
+    def _check_mounted_uses(self) -> None:
+        """A mounted router whose name is used for anything but its own method
+        calls (`sub.Get(...)`, `sub.Use(...)`) and the mount itself may be
+        served another way: `http.ListenAndServe(addr, sub)`, `http.Serve(ln,
+        sub)`, `srv.Handler = sub`, `handlers.LoggingHandler(w, sub)`,
+        `mux.HandleFunc("/", sub.ServeHTTP)`. Likewise a builder function
+        used again. Either way the router is reachable without the parent's
+        middleware: ambiguous (auth unknown, its own path)."""
+        # Functions / methods by name -> (target, mount argument span, is a
+        # method, declaration offset). Variables by name -> entries sorted by
+        # scope start, so an occurrence only checks the scopes around it.
+        functions: dict[str, list[tuple[Binding, tuple[int, int], bool, int]]] = {}
+        variables: dict[str, list[tuple[int, Binding, tuple[int, int]]]] = {}
+        for target, span, variable, function, function_offset, method in self._mounted:
+            if variable is not None:
+                variables.setdefault(variable, []).append((target.scope[0], target, span))
+            if function is not None:
+                functions.setdefault(function, []).append((target, span, method, function_offset))
+        if not functions and not variables:
+            return
+        scope_starts: dict[str, list[int]] = {}
+        for name, entries in variables.items():
+            entries.sort(key=lambda entry: entry[0])
+            scope_starts[name] = [entry[0] for entry in entries]
+        content = self.content
+        seen = 0
+        for match in _IDENT.finditer(content):
+            name = match.group()
+            if name not in functions and name not in variables:
+                continue
+            seen += 1
+            if seen > _MAX_MOUNT_USES:
+                for target, *_ in self._mounted:
+                    target.prefix, target.ambiguous = None, True
+                return
+            offset = match.start()
+            if in_literal(content, offset):
+                continue
+            selector = _SELECTOR_BEFORE.search(content, max(0, offset - 16), offset) is not None
+            for target, span, method, declared in functions.get(name, ()):
+                # A method is used as `x.name`, a function as a bare name; the
+                # other spelling is something else of the same name.
+                if target.ambiguous or span[0] <= offset < span[1] or offset == declared or selector != method:
+                    continue
+                target.prefix, target.ambiguous = None, True
+            entries = variables.get(name)
+            if not entries or selector:
+                continue  # `x.sub` is another value's field
+            index = bisect.bisect_right(scope_starts[name], offset) - 1
+            for _ in range(_MAX_NESTED_SCOPES):  # the (few) scopes that can contain it
+                if index < 0:
+                    break
+                _, target, span = entries[index]
+                index -= 1
+                if target.ambiguous or span[0] <= offset < span[1] or offset == target.offset:
+                    continue
+                if not target.scope[0] <= offset <= target.scope[1]:
+                    continue
+                call = _METHOD_CALL.match(content, match.end())
+                if call and call.group(1) != "ServeHTTP":
+                    continue
+                if _RETURN_BEFORE.search(content, max(0, offset - 16), offset):
+                    continue  # a builder returning it to the mount
+                target.prefix, target.ambiguous = None, True
 
     # -- resolution --
 
