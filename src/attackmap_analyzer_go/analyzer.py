@@ -20,21 +20,25 @@ import os
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from . import route_auth as ra
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
+from . import route_auth as ra
 
 CODE_SUFFIXES = {".go"}
 # vendor/, .git, node_modules, dist and build are all in the SDK defaults, which
