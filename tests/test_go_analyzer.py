@@ -1158,7 +1158,7 @@ def test_route_extraction_survives_garbage_and_truncation() -> None:
     import random
     import time
 
-    from attackmap_analyzer_go.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     analyzer = GoAnalyzer()
     rng = random.Random(1234)
@@ -1188,7 +1188,7 @@ def test_route_extraction_survives_garbage_and_truncation() -> None:
 def test_route_scopes_stay_linear_on_adversarial_nesting() -> None:
     import time
 
-    from attackmap_analyzer_go.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     depth = 2000
     nested = (
@@ -1303,7 +1303,7 @@ def _best_seconds(run, repeat: int = 3) -> float:
 def _ratio(make, small: int) -> float:
     """Cost of 4x the input over the input: ~4 when linear, ~16 when quadratic.
     Measured as a ratio so a slow runner doesn't matter."""
-    from attackmap_analyzer_go.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     small_src, large_src = make(small), make(4 * small)
     return _best_seconds(lambda: GoAnalyzer()._extract_routes(large_src, "f.go", ScanResult(root="."))) / _best_seconds(
@@ -1336,7 +1336,7 @@ def _many_routes(n: int) -> str:
 def test_large_files_stay_linear() -> None:
     """Many mounts of builder functions, many same-named methods (`h.Routes()`),
     and many routes in one file."""
-    from attackmap_analyzer_go.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     result = ScanResult(root=".")
     GoAnalyzer()._extract_routes(_mounts(2000), "f.go", result)
@@ -1349,7 +1349,7 @@ def test_large_files_stay_linear() -> None:
 def test_many_files_stay_linear() -> None:
     """The per-file route index starts empty, rather than being rebuilt from
     every route of the files before (quadratic across a large repo)."""
-    from attackmap_analyzer_go.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     source = _many_routes(4)
 
