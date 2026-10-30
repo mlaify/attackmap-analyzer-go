@@ -283,6 +283,53 @@ def test_gorm_mysql_redis_each_emit_distinct_kinds(tmp_path: Path) -> None:
 # ---------- Auth ----------
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        # import alone, a comment, a claims type, signing, an unverified parse
+        "",
+        "// TODO: verify the jwt here\n",
+        "func _a() { _ = jwt.MapClaims{} }\n",
+        "func _b() { _ = jwt.NewWithClaims(jwt.SigningMethodHS256, c) }\n",
+        "func _c() { _, _, _ = jwt.NewParser().ParseUnverified(s, c) }\n",
+    ],
+)
+def test_jwt_hint_needs_a_verifying_call(tmp_path: Path, body: str) -> None:
+    (tmp_path / "auth.go").write_text(
+        'package auth\nimport "github.com/golang-jwt/jwt/v5"\n' + body, encoding="utf-8"
+    )
+    result = GoAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+@pytest.mark.parametrize(
+    "call", ["jwt.Parse(s, kf)", "jwt.ParseWithClaims(s, &c, kf)", "jwt.NewParser().ParseWithClaims(s, &c, kf)"]
+)
+def test_jwt_hint_from_verifying_call(tmp_path: Path, call: str) -> None:
+    (tmp_path / "auth.go").write_text(
+        f'package auth\nimport "github.com/golang-jwt/jwt/v5"\nfunc _x() {{ _, _ = {call} }}\n',
+        encoding="utf-8",
+    )
+    hints = [h for h in GoAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [3]
+
+
+def test_jwt_middleware_hints_need_verifying_calls(tmp_path: Path) -> None:
+    (tmp_path / "config.go").write_text(
+        'package server\nimport (\n\t"github.com/go-chi/jwtauth/v5"\n\techojwt "github.com/labstack/echo-jwt/v4"\n)\n'
+        'var ta = jwtauth.New("HS256", []byte(secret), nil)\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "routes.go").write_text(
+        "package server\n"
+        "func r() {\n\tr.Use(jwtauth.Verifier(ta))\n\te.Use(echojwt.WithConfig(cfg))\n}\n",
+        encoding="utf-8",
+    )
+    hints = {(h.hint, h.file) for h in GoAnalyzer().analyze(tmp_path).auth_hints}
+    assert ("chi_jwtauth", "routes.go") in hints and ("echo_jwt", "routes.go") in hints
+    assert not any(f == "config.go" for _, f in hints)
+
+
 def test_jwt_bcrypt_oauth_emit_high_confidence_hints(tmp_path: Path) -> None:
     (tmp_path / "auth.go").write_text(
         'package auth\n'
@@ -291,7 +338,7 @@ def test_jwt_bcrypt_oauth_emit_high_confidence_hints(tmp_path: Path) -> None:
         '    "golang.org/x/crypto/bcrypt"\n'
         '    "golang.org/x/oauth2"\n'
         ')\n'
-        'func _x() { _ = jwt.MapClaims{}; _, _ = bcrypt.GenerateFromPassword(nil, 12); _ = oauth2.Config{} }\n',
+        'func _x() { _, _ = jwt.Parse(s, kf); _, _ = bcrypt.GenerateFromPassword(nil, 12); _ = oauth2.Config{} }\n',
         encoding="utf-8",
     )
     result = GoAnalyzer().analyze(tmp_path)
@@ -462,7 +509,7 @@ def test_full_gin_service_produces_expected_signal_set(tmp_path: Path) -> None:
         'func main() {\n'
         '    _ = os.Getenv("JWT_SECRET")\n'
         '    _, _ = sql.Open("postgres", os.Getenv("DATABASE_URL"))\n'
-        '    _ = jwt.MapClaims{}\n'
+        '    _, _ = jwt.ParseWithClaims(tok, &jwt.MapClaims{}, kf)\n'
         '    _, _ = http.Get("https://api.example.com/data")\n'
         '\n'
         '    r := gin.Default()\n'

@@ -153,17 +153,23 @@ DB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\bdynamodb\.New\w*\('), "dynamodb"),
 ]
 
-# Auth-related signals
+# Auth-related signals. Core credits any auth hint near a route as that route's
+# auth, so JWT hints come from calls that verify a token (AttackMap#325): an
+# import path, signing (`NewWithClaims`), a claims type or a config constructor
+# authenticates nobody.
 AUTH_PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
-    (re.compile(r'\bgolang-jwt/jwt\b|\bjwt-go\b|\bjwt\.(?:Parse|NewWithClaims|MapClaims)\b'), "jwt", 0.85),
+    # golang-jwt / jwx `jwt.Parse` / `ParseWithClaims` verify; `ParseUnverified`
+    # and `ParseInsecure` don't, and the `\s*\(` keeps them out.
+    (re.compile(r'\bjwt\.Parse(?:WithClaims)?\s*\(|\.ParseWithClaims\s*\('), "jwt", 0.85),
     (re.compile(r'\bx/crypto/bcrypt\b|\bbcrypt\.GenerateFromPassword\b'), "bcrypt", 0.9),
     (re.compile(r'\bx/crypto/argon2\b|\bargon2\.IDKey\b'), "argon2", 0.9),
     (re.compile(r'\bx/crypto/scrypt\b'), "scrypt", 0.9),
     (re.compile(r'\bx/oauth2\b|\boauth2\.Config\b'), "oauth", 0.85),
     (re.compile(r'\bgorilla/sessions\b|\bsessions\.NewCookieStore\('), "gorilla_sessions", 0.85),
     (re.compile(r'\bcasbin\.NewEnforcer\(|\bcasbin/v\d+\b'), "casbin_authz", 0.9),
-    (re.compile(r'\bgo-chi/jwtauth\b|\bjwtauth\.New\('), "chi_jwtauth", 0.85),
-    (re.compile(r'\bechojwt\b|\becho-jwt\b'), "echo_jwt", 0.85),
+    # jwtauth.New only builds the config; Verifier/Verify*/Authenticator check.
+    (re.compile(r'\bjwtauth\.(?:Verifier|Verify|VerifyToken|VerifyRequest|Authenticator)\s*\('), "chi_jwtauth", 0.85),
+    (re.compile(r'\bechojwt\.(?:JWT|WithConfig)\s*\(|\bmiddleware\.JWT(?:WithConfig)?\s*\('), "echo_jwt", 0.85),
     (re.compile(r'\bAuthorization\b'), "authorization_header", 0.6),
     (re.compile(r'\bBearer\b'), "bearer_token", 0.6),
     (re.compile(r'\bapi[_-]?key\b', re.IGNORECASE), "api_key", 0.6),

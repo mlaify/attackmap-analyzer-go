@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need a verifying call (#14, AttackMap#325)
+
+- The `jwt` auth hint now comes only from `jwt.Parse(` / `jwt.ParseWithClaims(` / `.ParseWithClaims(`. Before, the import path (`golang-jwt/jwt`, `jwt-go`), `jwt.NewWithClaims` (signing) and `jwt.MapClaims` (a type) also counted. Core credits any auth hint near a route as that route's auth, so a file that only signs tokens made its routes look protected. `ParseUnverified` doesn't count.
+- The same applies to `chi_jwtauth` and `echo_jwt`. They need `jwtauth.Verifier`/`Verify`/`VerifyToken`/`VerifyRequest`/`Authenticator`, or `echojwt.JWT`/`WithConfig` and `middleware.JWT`/`JWTWithConfig`. The import path and the `jwtauth.New` config no longer count.
+- On gitea@eb3bc19: 9 → 4 `jwt` hints. All four remaining are on the `ParseWithClaims` line that core's `jwt_verified` also reports. The other five files only sign or generate tokens. Findings are unchanged.
+
 ### Added — route shapes and group prefixes (#3)
 
 - **Go 1.22 ServeMux patterns.** `mux.HandleFunc("GET /items/{id}", h)` is `GET /items/{id}` (it was path `"GET /items/{id}"`, method `ANY`). A host (`"POST example.com/x"`) is kept as a `route_host:example.com` service hint quoting the registration; the route is `POST /x`.
