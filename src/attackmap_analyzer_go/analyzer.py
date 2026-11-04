@@ -292,7 +292,7 @@ class GoAnalyzer:
     metadata = AnalyzerMetadata(
         name="go",
         display_name="Go Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Go ecosystem analyzer covering net/http, chi, gin, echo, fiber, gorilla/mux, and common DB/auth packages.",
         scope="Go modules and workspaces. go.mod-bearing repos are auto-detected; pure .go trees also work.",
         targets=["go", "golang", "gin", "chi", "echo", "fiber"],
