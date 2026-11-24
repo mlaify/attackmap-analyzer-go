@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -292,7 +293,8 @@ class GoAnalyzer:
     metadata = AnalyzerMetadata(
         name="go",
         display_name="Go Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-go", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Go ecosystem analyzer covering net/http, chi, gin, echo, fiber, gorilla/mux, and common DB/auth packages.",
         scope="Go modules and workspaces. go.mod-bearing repos are auto-detected; pure .go trees also work.",
         targets=["go", "golang", "gin", "chi", "echo", "fiber"],
